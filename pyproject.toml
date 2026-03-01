@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools==67.8.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tradsl"
+version = "0.0.2"
+description = "A domain-specific configuration language for trading systems"
+readme = "README.md"
+authors = [
+    {name = "zecant", email = "support@zecant.com"}
+]
+dependencies = [
+    "pandas",
+    "numpy",
+]
+requires-python = ">=3.8"
+license = { file = "LICENSE" }
+
+[project.urls]
+Homepage = "https://github.com/zecant/8disco"
+Issues = "https://github.com/zecant/8disco/issues"

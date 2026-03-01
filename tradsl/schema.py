@@ -13,7 +13,14 @@ FIELD_SCHEMA = {
     },
     'model': {
         'required': ['type', 'class', 'inputs'],
-        'optional': ['params', 'train_window', 'retrain_schedule'],
+        'optional': [
+            'params',
+            'dotraining',
+            'load_from',
+            'retrain_schedule',
+            'training_window',
+            'training_window_size',
+        ],
     },
     'agent': {
         'required': ['type', 'inputs', 'tradable'],

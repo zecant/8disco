@@ -1,26 +1,34 @@
 # tradsl
 
-A powerful domain-specific configuration language for trading systems. Define your trading strategy, models, data adapters, and backtest configuration in a single declarative DSL.
+A powerful domain-specific configuration language for trading systems. Define your trading strategy, models, data adapters, and backtest configuration in a single declarative DSL with built-in feature computation and backtesting.
 
 ## Features
 
-- **Declarative DSL** - Define timeseries, models, agents, and parameters in a simple text format
+- **Declarative DSL** - Define timeseries, models, agents, adapters, and parameters in a simple text format
 - **Parameter Blocks** - Reusable parameter sets (`mlparams:`, `windowparams:`) that can be referenced across your config
 - **Data Adapters** - Plug in any data source adapter via class path resolution
 - **Submodels** - Use models as inputs to other models for ensemble/hierarchical strategies
 - **DAG Execution** - Automatic topological ordering with cycle detection
 - **Type Safety** - Schema validation for all config blocks
+- **Feature Engine** - Compute features via DAG with support for timeseries functions and model predictions
+- **Training Scheduler** - Rolling/expanding window training with configurable retrain schedules
+- **Backtest Interpreter** - Run full backtests with event-driven feature computation
+- **Violent Failure** - Explicit errors for invalid sizer output, model failures, and data issues
 
 ## Installation
 
 ```bash
-pip install -e .
+pip install tradsl
 ```
+
+Requires: `pandas`, `numpy`
 
 ## Quick Start
 
 ```python
 import tradsl
+from tradsl.utils import TradslInterpreter, load_timeseries, compute_features
+from datetime import datetime
 
 # Define your strategy
 config_str = """
@@ -46,12 +54,17 @@ parameters=["^VIX"]
 type=timeseries
 function=rolling_mean
 inputs=[nvda]
+params=mlparams
 
 :signal_model
 type=model
 class=RandomForest
 inputs=[nvda, vix, nvda_ma30]
 params=mlparams
+dotraining=true
+retrain_schedule=weekly
+training_window=rolling
+training_window_size=500
 
 :agent
 type=agent
@@ -67,29 +80,42 @@ capital=100000
 """
 
 # Define your Python functions/classes
-def rolling_mean(data, window=30):
-    pass
+def rolling_mean(data, **kwargs):
+    window = kwargs.get('window', 30)
+    return data.rolling(window=window).mean()
 
 class RandomForest:
-    pass
+    def __init__(self, lr=0.001, epochs=100, **kwargs):
+        self.lr = lr
+        self.epochs = epochs
+    
+    def train(self, X, y, **kwargs):
+        # Training logic here
+        pass
+    
+    def predict(self, X, **kwargs):
+        # Return dict of output_name -> values
+        return {'allocation': [0.5] * len(X)}
 
 def kelly_sizer(signals, tradable):
-    pass
+    """Must return dict mapping each tradable symbol to allocation weight"""
+    return {sym: 1.0 / len(tradable) for sym in tradable}
 
 # Parse and resolve
 config = tradsl.parse(config_str, context={
     'rolling_mean': rolling_mean,
     'RandomForest': RandomForest,
     'kelly_sizer': kelly_sizer,
+    'adapters.YFAdapter': YourAdapterClass,
 })
 
-# Access resolved config
-agent_config = config['agent']
-model_config = config['signal_model']
-
-# Execution order (topological sort)
-print(config['_execution_order'])
-# ['vix', 'nvda', 'nvda_ma30', 'signal_model', 'agent']
+# Run backtest
+interpreter = TradslInterpreter(config)
+results = interpreter.run_backtest(
+    start=datetime(2020, 1, 1),
+    end=datetime(2024, 1, 1),
+    frequency='1min'
+)
 ```
 
 ## DSL Syntax
@@ -141,6 +167,11 @@ type=model
 class=RandomForest
 inputs=[nvda, vix]
 params=mlparams
+dotraining=true
+retrain_schedule=weekly
+training_window=rolling
+training_window_size=500
+load_from=./models/signal_model.pkl
 ```
 
 ### Submodels (Model Ensemble)
@@ -183,6 +214,46 @@ The `parse()` function returns a dict with:
 - **`_execution_order`** - Topological sort of nodes
 - **`_graph`** - Dependency graph (deps, reverse_deps)
 
+## Utilities
+
+### load_timeseries(config, start, end, frequency)
+
+Load historical data from configured adapters:
+
+```python
+from tradsl.utils import load_timeseries
+from datetime import datetime
+
+df = load_timeseries(config, datetime(2020, 1, 1), datetime(2024, 1, 1))
+# Returns DataFrame with columns like nvda_close, vix_volume, etc.
+```
+
+### compute_features(config, data)
+
+Compute all features via DAG:
+
+```python
+from tradsl.utils import compute_features
+
+features = compute_features(config, raw_data)
+# Adds computed columns for timeseries functions and model predictions
+```
+
+### TradslInterpreter
+
+Full backtest runner:
+
+```python
+from tradsl.utils import TradslInterpreter
+
+interpreter = TradslInterpreter(config)
+interpreter.load_data(start, end)
+interpreter.compute_initial_features()
+interpreter.train_models()
+
+results = interpreter.run_backtest(start, end, frequency='1min')
+```
+
 ## Context Resolution
 
 When calling `tradsl.parse()`, pass a `context` dict with:
@@ -198,10 +269,21 @@ config = tradsl.parse(source, context={
 })
 ```
 
-## Development
+## Violent Failure
+
+The system uses **violent failure** - explicit errors are raised for:
+
+- **Sizer output**: Wrong keys, None, NaN/Inf, negative values, non-dict returns
+- **Model prediction**: Failures or wrong return types
+- **Training**: Instantiation failures, training errors
+- **Data loading**: Adapter failures or empty data
+
+This prevents silent failures and makes debugging explicit.
+
+## Testing
 
 ```bash
-# Run tests
+# Run all tests
 python -m pytest tradsl/ -v
 
 # Run specific test file
