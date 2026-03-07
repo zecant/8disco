@@ -2,30 +2,41 @@
 NautilusTrader strategy wrapper for tradsl.
 
 Wraps tradsl models and sizers in a NautilusTrader Strategy.
+Requires NautilusTrader to be installed - fails fast if not available.
 """
 
-from typing import Dict, List, Optional, Any, Callable, Set
+from typing import Dict, List, Optional, Any, Callable
 from decimal import Decimal
-from datetime import datetime
-from dataclasses import dataclass, field
 import pandas as pd
 import numpy as np
 
+# Import NautilusTrader - fail fast if not available
+from nautilus_trader.trading.strategy import Strategy
+from nautilus_trader.config import StrategyConfig as NTConfig
+from nautilus_trader.model.data import Bar, BarSpecification, BarType
+from nautilus_trader.model.identifiers import InstrumentId, Symbol, Venue
+from nautilus_trader.model.enums import OrderSide, BarAggregation, PriceType
+from nautilus_trader.model.orders import MarketOrder
+from nautilus_trader.core.uuid import UUID4
 
-@dataclass
-class NautilusStrategyConfig:
-    """Configuration for NautilusStrategy."""
+
+class NautilusStrategyConfig(NTConfig, frozen=True):
+    """
+    Configuration for NautilusStrategy.
+    
+    Inherits from NT StrategyConfig to be compatible with NautilusTrader.
+    """
     
     strategy_id: str = "tradsl_strategy"
     order_id_tag: str = "tradsl"
-    tradsl_config: Dict = field(default_factory=dict)
-    symbols: List[str] = field(default_factory=list)
+    tradsl_config: Dict = None
+    symbols: List[str] = None
     venue: str = "BACKTEST"
     bar_type: str = "1-MINUTE-LAST-EXTERNAL"
     position_size: Decimal = Decimal("1")
 
 
-class NautilusStrategy:
+class NautilusStrategy(Strategy):
     """
     NautilusTrader Strategy that uses tradsl models and sizers.
     
@@ -35,15 +46,18 @@ class NautilusStrategy:
     - Generates signals using tradsl models
     - Calculates allocations using tradsl sizers
     - Executes orders via NautilusTrader
+    
+    Must inherit from NT Strategy to work with NT engine.
     """
     
     def __init__(self, config: NautilusStrategyConfig):
-        self.config = config
-        self.tradsl_config = config.tradsl_config
-        self.symbols = config.symbols
-        self.venue = config.venue
-        self.bar_type = config.bar_type
-        self.position_size = config.position_size
+        super().__init__(config)
+        
+        self._tradsl_config = config.tradsl_config or {}
+        self._symbols = config.symbols or []
+        self._venue = config.venue
+        self._bar_type = config.bar_type
+        self._position_size = config.position_size
         
         self.models: Dict[str, Any] = {}
         self.sizer: Optional[Any] = None
@@ -51,114 +65,119 @@ class NautilusStrategy:
         
         self.market_data: Dict[str, pd.DataFrame] = {}
         self.feature_df: Optional[pd.DataFrame] = None
+        self.bar_types: Dict[str, InstrumentId] = {}
         
-        self.bar_types: Dict[str, Any] = {}
-        
-        self._is_initialized = False
         self._historical_data_loaded = False
+        self._instruments: Dict[str, Any] = {}
         
-        self._trader_id = None
-        self._strategy_id = None
-        self._clock = None
-        self._cache = None
-        self._portfolio = None
-        self._order_factory = None
-    
-    def _check_initialized(self):
-        """Check if strategy is properly initialized."""
-        if not self._is_initialized:
-            raise RuntimeError("Strategy not initialized. Call on_start first.")
-    
-    def _initialize_instruments(self):
-        """Initialize instrument mappings."""
-        try:
-            from nautilus_trader.model.identifiers import Symbol, Venue
-            from nautilus_trader.model.data import BarType
-            from nautilus_trader.model.objects import BarSpecification
-        except ImportError:
-            return
+        self.instrument_ids: Dict[str, InstrumentId] = {}
         
-        for symbol in self.symbols:
-            try:
-                instrument_id = self._get_instrument_id(symbol)
-                bar_spec = self._parse_bar_spec(self.bar_type)
-                bar_type = BarType(
-                    instrument_id=instrument_id,
-                    bar_spec=bar_spec,
-                    aggregation_source=1,
-                )
-                self.bar_types[symbol] = bar_type
-            except Exception:
-                pass
+        self._initialize_tradsl()
     
-    def _get_instrument_id(self, symbol: str):
-        """Get instrument ID for symbol."""
-        try:
-            from nautilus_trader.model.identifiers import InstrumentId, Symbol, Venue
-            return InstrumentId(Symbol(symbol), Venue(self.venue))
-        except ImportError:
-            return None
+    @property
+    def tradsl_config(self) -> Dict:
+        return self._tradsl_config
     
-    def _parse_bar_spec(self, bar_type_str: str):
-        """Parse bar type string to BarSpecification."""
-        try:
-            from nautilus_trader.model.objects import BarSpecification
-            from nautilus_trader.model.enums import BarAggregation, PriceType
+    @property
+    def symbols(self) -> List[str]:
+        return self._symbols
+    
+    @property
+    def venue(self) -> str:
+        return self._venue
+    
+    @property
+    def bar_type_str(self) -> str:
+        return self._bar_type
+    
+    @property
+    def position_size(self):
+        return self._position_size
+    
+    def on_start(self):
+        """Called when strategy starts."""
+        self._log.info("NautilusStrategy starting...")
+        
+        self._setup_instruments()
+        
+        self._subscribe_to_data()
+        
+        self._load_historical_data()
+        
+        self._log.info(f"NautilusStrategy started with {len(self.symbols)} symbols")
+    
+    def _setup_instruments(self):
+        """Set up instrument IDs and bar types for each symbol."""
+        for symbol in self._symbols:
+            instrument_id = InstrumentId(Symbol(symbol), Venue(self._venue))
+            self.instrument_ids[symbol] = instrument_id
             
-            parts = bar_type_str.split("-")
-            step = int(parts[0])
-            aggregation_str = parts[1].upper()
+            bar_spec = self._parse_bar_spec(self._bar_type)
             
-            aggregation_map = {
-                "MINUTE": BarAggregation.MINUTE,
-                "HOUR": BarAggregation.HOUR,
-                "DAY": BarAggregation.DAY,
-            }
-            
-            agg = aggregation_map.get(aggregation_str, BarAggregation.MINUTE)
-            
-            return BarSpecification(
-                step=step,
-                aggregation=agg,
-                price_type=PriceType.LAST,
+            bar_type_nt = BarType(
+                instrument_id=instrument_id,
+                bar_spec=bar_spec,
+                aggregation_source=1,
             )
-        except ImportError:
-            return None
+            self.bar_types[symbol] = bar_type_nt
     
-    def _initialize_models(self):
-        """Initialize tradsl models from config."""
-        if 'models' not in self.tradsl_config:
-            return
+    def _parse_bar_spec(self, bar_type_str: str) -> BarSpecification:
+        """Parse bar type string to BarSpecification."""
+        parts = bar_type_str.split("-")
+        step = int(parts[0])
+        aggregation_str = parts[1].upper()
         
-        models_config = self.tradsl_config['models']
+        aggregation_map = {
+            "MINUTE": BarAggregation.MINUTE,
+            "HOUR": BarAggregation.HOUR,
+            "DAY": BarAggregation.DAY,
+            "WEEK": BarAggregation.WEEK,
+            "MONTH": BarAggregation.MONTH,
+        }
         
-        for symbol, model in models_config.items():
-            self.models[symbol] = model
+        agg = aggregation_map.get(aggregation_str, BarAggregation.MINUTE)
+        
+        return BarSpecification(
+            step=step,
+            aggregation=agg,
+            price_type=PriceType.LAST,
+        )
     
-    def _initialize_sizer(self):
-        """Initialize position sizer from config."""
-        if 'sizer' in self.tradsl_config:
-            self.sizer = self.tradsl_config['sizer']
+    def _initialize_tradsl(self):
+        """Initialize tradsl models and sizers from config."""
+        from tradsl.models import DecisionTreeModel
+        from tradsl.sizing import EqualWeightSizer, create_sizer
+        
+        if 'models' in self._tradsl_config:
+            models_config = self._tradsl_config['models']
+            for symbol, model in models_config.items():
+                self.models[symbol] = model
+                self._log.info(f"Loaded model for {symbol}")
+        
+        if 'sizer' in self._tradsl_config:
+            sizer_config = self._tradsl_config['sizer']
+            if isinstance(sizer_config, dict):
+                sizer_type = sizer_config.get('type', 'equal')
+                sizer_params = sizer_config.get('params', {})
+                self.sizer = create_sizer(sizer_type, **sizer_params)
+            else:
+                self.sizer = sizer_config
+            self._log.info(f"Loaded sizer: {type(self.sizer).__name__}")
     
     def _subscribe_to_data(self):
         """Subscribe to bar data for all symbols."""
         for symbol, bar_type in self.bar_types.items():
-            try:
-                self.subscribe_bars(bar_type)
-            except Exception:
-                pass
+            self.subscribe_bars(bar_type)
+            self._log.info(f"Subscribed to {bar_type}")
     
     def _load_historical_data(self):
-        """Load historical data and compute initial features."""
-        try:
-            from tradsl.utils.feature_engine import compute_features
-        except ImportError:
+        """Load historical data from config if available."""
+        from tradsl.utils.feature_engine import compute_features
+        
+        if 'data' not in self._tradsl_config:
             return
         
-        if 'data' not in self.tradsl_config:
-            return
-        
-        data = self.tradsl_config['data']
+        data = self._tradsl_config['data']
         
         if not data:
             return
@@ -168,107 +187,68 @@ class NautilusStrategy:
         
         if self.market_data:
             try:
-                dag_config = self.tradsl_config.get('dag_config', {})
+                dag_config = self._tradsl_config.get('dag_config', {})
                 combined = pd.concat(self.market_data.values()) if len(self.market_data) > 1 else list(self.market_data.values())[0]
                 self.feature_df = compute_features(dag_config, combined)
                 self._historical_data_loaded = True
-            except Exception:
-                self.feature_df = pd.DataFrame()
-                self._historical_data_loaded = True
+                self._log.info(f"Loaded historical data: {len(self.feature_df)} rows")
+            except Exception as e:
+                self._log.error(f"Failed to compute features: {e}")
+                raise
     
-    def on_start(self):
-        """Called when strategy starts."""
-        self._is_initialized = True
-        
-        self._initialize_instruments()
-        self._initialize_models()
-        self._initialize_sizer()
-        self._subscribe_to_data()
-        self._load_historical_data()
-    
-    def on_bar(self, bar: Any):
+    def on_bar(self, bar: Bar):
         """Called on each new bar."""
-        if not self._is_initialized:
-            return
-        
-        symbol = getattr(bar.bar_type, 'instrument_id', None)
-        if symbol:
-            symbol = getattr(symbol, 'symbol', None)
-            if symbol:
-                symbol = getattr(symbol, 'value', str(symbol))
-        
-        if not symbol:
-            return
-        
-        self._update_market_data(symbol, bar)
-        
         if not self._historical_data_loaded:
             return
         
-        self._update_features(symbol, bar)
+        symbol = bar.bar_type.instrument_id.symbol.value
+        
+        self._update_market_data(symbol, bar)
+        
+        self._update_features(symbol)
         
         signals = self._generate_signals(symbol)
         
         self._execute_signals(signals)
     
-    def _update_market_data(self, symbol: str, bar: Any):
+    def _update_market_data(self, symbol: str, bar: Bar):
         """Update market data DataFrame with new bar."""
-        try:
-            ts_event = getattr(bar, 'ts_event', 0)
-            timestamp = pd.to_datetime(ts_event, unit='ns', utc=True)
-            timestamp = timestamp.tz_localize(None)
-        except Exception:
-            timestamp = datetime.now()
-        
-        try:
-            open_price = float(getattr(bar, 'open', 0))
-            high_price = float(getattr(bar, 'high', 0))
-            low_price = float(getattr(bar, 'low', 0))
-            close_price = float(getattr(bar, 'close', 0))
-            volume = float(getattr(bar, 'volume', 0))
-        except Exception:
-            return
+        timestamp = pd.to_datetime(bar.ts_event, unit='ns', utc=True).tz_localize(None)
         
         if symbol not in self.market_data:
             self.market_data[symbol] = pd.DataFrame()
         
         new_row = pd.DataFrame({
-            'open': [open_price],
-            'high': [high_price],
-            'low': [low_price],
-            'close': [close_price],
-            'volume': [volume],
+            'open': [float(bar.open)],
+            'high': [float(bar.high)],
+            'low': [float(bar.low)],
+            'close': [float(bar.close)],
+            'volume': [float(bar.volume)],
         }, index=[timestamp])
         
         self.market_data[symbol] = pd.concat([self.market_data[symbol], new_row])
         
-        max_bars = self.tradsl_config.get('max_history_bars', 1000)
+        max_bars = self._tradsl_config.get('max_history_bars', 1000)
         if len(self.market_data[symbol]) > max_bars:
             self.market_data[symbol] = self.market_data[symbol].iloc[-max_bars:]
     
-    def _update_features(self, symbol: str, bar: Any):
+    def _update_features(self, symbol: str):
         """Update features for the new bar."""
-        try:
-            from tradsl.utils.feature_engine import compute_features_incremental
-        except ImportError:
-            return
+        from tradsl.utils.feature_engine import compute_features_incremental
         
         if self.feature_df is None:
             return
         
         try:
             combined = pd.concat(self.market_data.values()) if len(self.market_data) > 1 else list(self.market_data.values())[0]
-            dag_config = self.tradsl_config.get('dag_config', {})
+            dag_config = self._tradsl_config.get('dag_config', {})
             self.feature_df = compute_features_incremental(dag_config, combined, self.market_data[symbol].iloc[-1])
-        except Exception:
-            pass
+        except Exception as e:
+            self._log.warning(f"Feature update failed: {e}")
     
     def _generate_signals(self, symbol: str):
         """Generate trading signals for a symbol."""
-        try:
-            from tradsl.signals import SignalBatch, TradingSignal
-        except ImportError:
-            return None
+        from tradsl.signals import SignalBatch, TradingSignal
         
         if symbol not in self.models:
             return None
@@ -306,12 +286,13 @@ class NautilusStrategy:
             batch.add(signal)
             return batch
             
-        except Exception:
+        except Exception as e:
+            self._log.warning(f"Signal generation failed: {e}")
             return None
     
     def _get_model_inputs(self, symbol: str) -> List[str]:
         """Get input columns for a model."""
-        dag_config = self.tradsl_config.get('dag_config', {})
+        dag_config = self._tradsl_config.get('dag_config', {})
         
         if not dag_config:
             return list(self.feature_df.columns) if self.feature_df is not None else []
@@ -333,24 +314,21 @@ class NautilusStrategy:
     
     def _execute_signals(self, signals):
         """Execute trades based on signals."""
-        try:
-            from tradsl.signals import TradingAction
-        except ImportError:
-            return
+        from tradsl.signals import TradingAction
         
         if signals is None or len(signals) == 0:
             return
         
         for symbol, signal in signals.signals.items():
-            if not getattr(signal, 'is_actionable', False):
+            if not signal.is_actionable:
                 continue
             
-            instrument_id = self.bar_types.get(symbol)
+            instrument_id = self.instrument_ids.get(symbol)
             if not instrument_id:
                 continue
             
-            current_data = self.market_data.get(symbol, pd.DataFrame())
-            if current_data.empty:
+            current_data = self.market_data.get(symbol)
+            if current_data is None or current_data.empty:
                 continue
             
             try:
@@ -358,113 +336,54 @@ class NautilusStrategy:
             except Exception:
                 continue
             
-            order_side = getattr(signal, 'action', None)
-            if order_side is None:
-                continue
-            
-            try:
-                self._submit_order(symbol, instrument_id, order_side, price)
-            except Exception:
-                pass
+            self._submit_order(symbol, instrument_id, signal, price)
     
-    def _submit_order(self, symbol: str, instrument_id: Any, action: Any, price: float):
+    def _submit_order(self, symbol: str, instrument_id: InstrumentId, signal, price: float):
         """Submit an order to NautilusTrader."""
-        try:
-            from nautilus_trader.model.enums import OrderSide as NTOrderSide
-            from nautilus_trader.model.orders import MarketOrder
-            from nautilus_trader.core.uuid import UUID4
-            
-            if str(action).lower() == 'buy':
-                side = NTOrderSide.BUY
-            elif str(action).lower() == 'sell':
-                side = NTOrderSide.SELL
-            else:
-                return
-            
-            order = MarketOrder(
-                trader_id=self._trader_id,
-                strategy_id=self._strategy_id,
-                instrument_id=instrument_id,
-                client_order_id=UUID4(),
-                side=side,
-                quantity=self.position_size,
-                uuid4=UUID4(),
-                ts_init=self._clock.timestamp_ns() if self._clock else 0,
-                time_in_force=1,
-            )
-            
-            self.submit_order(order)
-            
-        except Exception:
-            pass
+        action = signal.action
+        
+        if str(action).lower() == 'buy':
+            side = OrderSide.BUY
+        elif str(action).lower() == 'sell':
+            side = OrderSide.SELL
+        else:
+            return
+        
+        order = MarketOrder(
+            trader_id=self.trader_id,
+            strategy_id=self.id,
+            instrument_id=instrument_id,
+            client_order_id=UUID4(),
+            side=side,
+            quantity=self._position_size,
+            uuid4=UUID4(),
+            ts_init=self.clock.timestamp_ns(),
+            time_in_force=1,
+        )
+        
+        self.submit_order(order)
+        
+        self._log.info(f"Submitted {side.value} order for {symbol}")
     
-    def on_order_filled(self, event: Any):
-        """Handle order fill events."""
-        pass
+    def on_order_filled(self, event):
+        """Handle order filled events."""
+        self._log.info(f"Order filled: {event}")
     
     def on_stop(self):
         """Called when strategy stops."""
-        try:
-            self.cancel_all_orders()
-            self.close_all_positions()
-        except Exception:
-            pass
+        self._log.info("NautilusStrategy stopping...")
+        
+        self.cancel_all_orders()
+        
+        self.close_all_positions()
+        
+        self._log.info("NautilusStrategy stopped")
     
     def on_reset(self):
         """Called when strategy resets."""
         self.market_data.clear()
         self.feature_df = None
-        self._is_initialized = False
         self._historical_data_loaded = False
-    
-    def _set_dependencies(self, trader_id: Any, strategy_id: Any, clock: Any, cache: Any, portfolio: Any, order_factory: Any):
-        """Set dependencies for the strategy."""
-        self._trader_id = trader_id
-        self._strategy_id = strategy_id
-        self._clock = clock
-        self._cache = cache
-        self._portfolio = portfolio
-        self._order_factory = order_factory
-    
-    @property
-    def trader_id(self):
-        return self._trader_id
-    
-    @property
-    def id(self):
-        return self._strategy_id
-    
-    @property
-    def clock(self):
-        return self._clock
-    
-    @property
-    def cache(self):
-        return self._cache
-    
-    @property
-    def portfolio(self):
-        return self._portfolio
-    
-    @property
-    def order_factory(self):
-        return self._order_factory
-    
-    def subscribe_bars(self, bar_type: Any):
-        """Subscribe to bars - placeholder."""
-        pass
-    
-    def submit_order(self, order: Any):
-        """Submit order - placeholder."""
-        pass
-    
-    def cancel_all_orders(self):
-        """Cancel all orders - placeholder."""
-        pass
-    
-    def close_all_positions(self):
-        """Close all positions - placeholder."""
-        pass
 
 
 def create_nautilus_strategy(
@@ -488,9 +407,13 @@ def create_nautilus_strategy(
     
     Returns:
         NautilusStrategy instance
+    
+    Raises:
+        ImportError: If NautilusTrader is not installed
     """
     config = NautilusStrategyConfig(
         strategy_id=strategy_id,
+        order_id_tag=strategy_id.lower().replace("_", "-"),
         symbols=symbols,
         venue=venue,
         bar_type=bar_type,

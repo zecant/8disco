@@ -2,6 +2,7 @@ from .parser import parse_config
 from .schema import validate, ConfigError
 from .resolver import resolve, ResolutionError
 from .dag import build_dag, CycleError
+from .functions import BUILTIN_FUNCTIONS
 
 
 __all__ = [
@@ -12,7 +13,8 @@ __all__ = [
     'parse',
     'ConfigError',
     'ResolutionError',
-    'CycleError'
+    'CycleError',
+    'BUILTIN_FUNCTIONS'
 ]
 
 
@@ -37,12 +39,12 @@ def parse(source: str, context: dict = None) -> dict:
         adapter=yfinance
         parameters=["nvda"]
         
-        # Derived timeseries with function
+        # Derived timeseries with function (uses built-in functions automatically)
         :nvda_ma30
         type=timeseries
-        function=rolling_mean
+        function=sma
         inputs=[nvda]
-        params=mlparams
+        params=window=30
         
         # Models (can use other models as inputs - submodels)
         :signal_model
@@ -69,6 +71,8 @@ def parse(source: str, context: dict = None) -> dict:
         source: DSL config string
         context: Python context for resolving function/class names and adapters.
                  Pass {name: callable} for functions, classes, sizers.
+                 Built-in functions (sma, ema, z_score, rsi, etc.) are
+                 automatically available.
                  For adapter class paths like 'adapters.YFAdapter', pass
                  {'adapters.YFAdapter': YourAdapterClass}.
         
@@ -82,31 +86,31 @@ def parse(source: str, context: dict = None) -> dict:
         - _graph: {deps, reverse_deps} dependency info
         
     Example:
-        >>> def rolling_mean(data, window=30): pass
-        >>> class RandomForest: pass
-        >>> def kelly_sizer(signals, tradable): pass
+        >>> from tradsl.models import DecisionTreeModel
         >>> 
         >>> config = parse('''
-        ... mlparams:
-        ... lr=0.001
-        ... 
         ... :agent
         ... type=agent
-        ... inputs=[spy, vix]
+        ... inputs=[spy]
         ... tradable=[spy]
-        ... sizer=kelly_sizer
+        ... sizer=equal_weight
         ... 
         ... :spy
         ... type=timeseries
         ... inputs=[]
         ... ''', context={
-        ...     'kelly_sizer': kelly_sizer,
-        ...     'rolling_mean': rolling_mean,
-        ...     'RandomForest': RandomForest,
+        ...     'equal_weight': lambda signals, tradable: ...,
+        ...     'DecisionTreeModel': DecisionTreeModel,
         ... })
-        >>> config['agent']['sizer'](...)
     """
     raw = parse_config(source)
     validated = validate(raw)
-    resolved = resolve(validated, context)
+    
+    # Merge built-in functions with user-provided context
+    # User context takes precedence over built-ins
+    merged_context = dict(BUILTIN_FUNCTIONS)
+    if context:
+        merged_context.update(context)
+    
+    resolved = resolve(validated, merged_context)
     return build_dag(resolved)

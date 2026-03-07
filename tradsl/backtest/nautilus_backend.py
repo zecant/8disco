@@ -2,16 +2,31 @@
 NautilusTrader execution backend for tradsl.
 
 Provides NautilusTrader-based backtesting execution.
+Requires NautilusTrader to be installed - fails fast if not available.
 """
 
-from typing import Dict, List, Optional, Any, Union, Callable
+from typing import Dict, List, Optional, Any
 from decimal import Decimal
-from datetime import datetime
 import pandas as pd
 import numpy as np
 
 from tradsl.backtest.execution import ExecutionBackend, Order, Fill
 from tradsl.backtest.engine import BacktestResult
+
+# Import NautilusTrader - fail fast if not available
+from nautilus_trader.backtest.engine import BacktestEngine
+from nautilus_trader.backtest.config import BacktestEngineConfig
+from nautilus_trader.config import LoggingConfig
+from nautilus_trader.model.enums import OmsType, AccountType
+from nautilus_trader.model.currencies import USD
+from nautilus_trader.model.objects import Money
+from nautilus_trader.model.identifiers import Symbol, Venue
+from nautilus_trader.model.instruments import Equity
+from nautilus_trader.model.objects import Price, Quantity
+from nautilus_trader.model.data import Bar, BarType, BarSpecification
+from nautilus_trader.model.enums import BarAggregation, PriceType
+
+from tradsl.backtest.nautilus_strategy import NautilusStrategy, NautilusStrategyConfig
 
 
 class NautilusBackend:
@@ -23,6 +38,8 @@ class NautilusBackend:
     - Uses tradsl models for signal generation
     - Uses tradsl sizers for position sizing
     - Uses NautilusTrader for order execution and simulation
+    
+    Requires NautilusTrader to be installed - fails fast if not available.
     
     Data Flow:
     1. Load data into NT BacktestEngine
@@ -41,18 +58,6 @@ class NautilusBackend:
         position_size: Decimal = Decimal("1"),
         log_level: str = "ERROR",
     ):
-        """
-        Initialize NautilusTrader backend.
-        
-        Args:
-            tradsl_config: Parsed tradsl config with models, sizers, DAG
-            venue: Venue name
-            bar_type: Bar type string
-            starting_balance: Starting capital
-            commission: Commission rate
-            position_size: Default position size per trade
-            log_level: NT logging level
-        """
         self.tradsl_config = tradsl_config
         self.venue = venue
         self.bar_type = bar_type
@@ -61,8 +66,8 @@ class NautilusBackend:
         self.position_size = position_size
         self.log_level = log_level
         
-        self.engine = None
-        self.strategy = None
+        self.engine: Optional[BacktestEngine] = None
+        self.strategy: Optional[NautilusStrategy] = None
         self.analyzer = None
     
     def run(
@@ -72,25 +77,6 @@ class NautilusBackend:
         sizer: Optional[Any] = None,
         train_models: bool = False,
     ) -> BacktestResult:
-        """
-        Run backtest using NautilusTrader.
-        
-        Args:
-            data: Dict mapping symbol -> OHLCV DataFrame
-            models: Dict mapping symbol -> trained model
-            sizer: Position sizer instance
-            train_models: Whether to train models before backtest
-        
-        Returns:
-            BacktestResult with equity curve, trades, summary
-        """
-        from nautilus_trader.backtest.engine import BacktestEngine
-        from nautilus_trader.backtest.config import BacktestEngineConfig
-        from nautilus_trader.config import LoggingConfig
-        from nautilus_trader.model.enums import Venue, OmsType, AccountType
-        from nautilus_trader.model.currencies import USD
-        from nautilus_trader.model.objects import Money
-        
         config_with_models = dict(self.tradsl_config)
         config_with_models['models'] = models or {}
         if sizer:
@@ -117,10 +103,9 @@ class NautilusBackend:
         
         self._add_data(data)
         
-        from tradsl.backtest.nautilus_strategy import NautilusStrategy, NautilusStrategyConfig
-        
         strategy_config = NautilusStrategyConfig(
             strategy_id="tradsl_strategy",
+            order_id_tag="tradsl",
             symbols=list(data.keys()),
             venue=self.venue,
             bar_type=self.bar_type,
@@ -143,10 +128,6 @@ class NautilusBackend:
     
     def _add_instruments(self, symbols):
         """Add instruments to the engine."""
-        from nautilus_trader.model.identifiers import Symbol
-        from nautilus_trader.model.instruments import Equity
-        from nautilus_trader.model.objects import Price, Quantity
-        
         for symbol in symbols:
             instrument_id = self._get_instrument_id(symbol)
             
@@ -175,14 +156,8 @@ class NautilusBackend:
         self,
         df: pd.DataFrame,
         symbol: str
-    ) -> List:
+    ) -> List[Bar]:
         """Convert DataFrame to NT Bars."""
-        from nautilus_trader.model.data import Bar, BarType
-        from nautilus_trader.model.identifiers import InstrumentId, Symbol, Venue
-        from nautilus_trader.model.objects import Price, Quantity
-        from nautilus_trader.model.objects import BarSpecification
-        from nautilus_trader.model.enums import BarAggregation, PriceType
-        
         df = df.copy()
         
         if 'timestamp' in df.columns:
@@ -248,7 +223,6 @@ class NautilusBackend:
     
     def _get_instrument_id(self, symbol: str):
         """Get instrument ID for symbol."""
-        from nautilus_trader.model.identifiers import InstrumentId, Symbol, Venue
         return InstrumentId(Symbol(symbol), Venue(self.venue))
     
     def _train_models(self, data: Dict[str, pd.DataFrame], models: Dict[str, Any]):
@@ -260,7 +234,7 @@ class NautilusBackend:
         
         combined_data = pd.concat(data.values()) if len(data) > 1 else list(data.values())[0]
         
-        dag_config = self.tradsl_config.get('_execution_order', {})
+        dag_config = self.tradsl_config.get('dag_config', {})
         
         try:
             features = compute_features(dag_config, combined_data)
@@ -283,7 +257,7 @@ class NautilusBackend:
                 
                 if y is not None and len(X) > 0 and len(y) > 0:
                     model.train(X, y)
-            except Exception as e:
+            except Exception:
                 pass
     
     def _extract_results(self) -> BacktestResult:
@@ -405,6 +379,9 @@ def run_nautilus_backtest(
     
     Returns:
         BacktestResult
+    
+    Raises:
+        ImportError: If NautilusTrader is not installed
     """
     backend = NautilusBackend(
         tradsl_config=tradsl_config,
