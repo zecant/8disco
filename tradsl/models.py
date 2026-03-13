@@ -1,328 +1,204 @@
 """
-ML Models for trading signal generation.
+Model Interfaces for TradSL
 
-Provides DecisionTreeModel for classification-based trading strategies.
+Section 10: BaseTrainableModel and BaseAgentArchitecture interfaces.
 """
-
-from sklearn.tree import DecisionTreeClassifier
+from abc import ABC, abstractmethod
+from typing import Optional, Dict, Any, Tuple, List
 import numpy as np
-import pandas as pd
-import pickle
-from pathlib import Path
-from typing import Optional, Dict, Any, Union
+from dataclasses import dataclass
+from enum import Enum
 
 
-class DecisionTreeModel:
+class TradingAction(Enum):
+    """Discrete action space actions."""
+    BUY = "buy"
+    SELL = "sell"
+    HOLD = "hold"
+    FLATTEN = "flatten"
+
+
+@dataclass
+class ModelSpec:
+    """Specification for a registered model."""
+    cls: type
+    description: str
+
+
+class BaseTrainableModel(ABC):
     """
-    Decision Tree classifier for generating trading signals.
+    Section 10.4.2: Supervised model interface.
     
-    Supports both 3-class (sell/hold/buy) and binary (sell/buy) classification.
-    Weak signals below confidence_threshold are treated as HOLD.
-    
-    DSL Usage:
-        :signal_model
-        type=model
-        class=tradsl.models.DecisionTreeModel
-        inputs=[nvda, vix]
-        params=max_depth=10
-        dotraining=true
-    
-    Parameters:
-        max_depth: Maximum tree depth (default 10)
-        min_samples_split: Min samples to split node (default 2)
-        min_samples_leaf: Min samples at leaf (default 1)
-        criterion: Split criterion 'gini' or 'entropy' (default 'gini')
-        class_weight: 'balanced', dict, or None (default None)
-        confidence_threshold: Min confidence to signal (default 0.4)
-        random_state: Random seed for reproducibility (default 42)
-        n_classes: Number of classes - 2 for binary, 3 for 3-class (default 3)
+    Trainable models fit to historical data and produce
+    intermediate outputs consumed by agent architectures.
     """
     
-    ACTION_MAP_3CLASS = {
-        0: 'sell',
-        1: 'hold',
-        2: 'buy'
-    }
+    @abstractmethod
+    def fit(self, features: np.ndarray, labels: np.ndarray) -> None:
+        """
+        Fit model to historical features and labels.
+        
+        Args:
+            features: Array of shape (n_samples, n_features)
+            labels: Array of shape (n_samples,)
+        
+        Constraints:
+            - Must complete synchronously
+            - Must not access data outside provided arrays
+        """
+        pass
     
-    ACTION_MAP_BINARY = {
-        0: 'sell',
-        1: 'buy'
-    }
+    @abstractmethod
+    def predict(self, features: np.ndarray) -> float:
+        """
+        Produce output for current bar.
+        
+        Args:
+            features: Array of shape (n_features,)
+        
+        Returns:
+            Scalar float (probability, value, etc.)
+            0.0 if not fitted
+        """
+        pass
     
-    def __init__(
+    @abstractmethod
+    def save_checkpoint(self, path: str) -> None:
+        """Save model state atomically."""
+        pass
+    
+    @abstractmethod
+    def load_checkpoint(self, path: str) -> None:
+        """Load model state."""
+        pass
+    
+    @property
+    @abstractmethod
+    def is_fitted(self) -> bool:
+        """True after at least one successful fit()."""
+        pass
+
+
+class BaseAgentArchitecture(ABC):
+    """
+    Section 10.6.2: RL agent architecture interface.
+    
+    Agent architectures receive observations and produce
+    trading actions with conviction.
+    """
+    
+    @abstractmethod
+    def observe(
         self,
-        max_depth: int = 10,
-        min_samples_split: int = 2,
-        min_samples_leaf: int = 1,
-        criterion: str = 'gini',
-        class_weight: Optional[Union[str, Dict]] = None,
-        confidence_threshold: float = 0.4,
-        random_state: int = 42,
-        n_classes: int = 3,
-        **kwargs
-    ):
-        self.max_depth = max_depth
-        self.min_samples_split = min_samples_split
-        self.min_samples_leaf = min_samples_leaf
-        self.criterion = criterion
-        self.class_weight = class_weight
-        self.confidence_threshold = confidence_threshold
-        self.random_state = random_state
-        self.n_classes = n_classes
-        
-        if criterion not in ('gini', 'entropy'):
-            raise ValueError(f"criterion must be 'gini' or 'entropy', got '{criterion}'")
-        
-        if n_classes not in (2, 3):
-            raise ValueError(f"n_classes must be 2 or 3, got {n_classes}")
-        
-        self.model = DecisionTreeClassifier(
-            max_depth=max_depth,
-            min_samples_split=min_samples_split,
-            min_samples_leaf=min_samples_leaf,
-            criterion=criterion,
-            class_weight=class_weight,
-            random_state=random_state
-        )
-        
-        self.is_trained = False
-    
-    def train(self, X: Union[np.ndarray, pd.DataFrame, pd.Series], 
-              y: Union[np.ndarray, pd.Series, pd.DataFrame] = None,
-              **kwargs) -> 'DecisionTreeModel':
+        observation: np.ndarray,
+        portfolio_state: Dict[str, float],
+        bar_index: int
+    ) -> Tuple[TradingAction, float]:
         """
-        Train the decision tree on features and labels.
+        Generate action and conviction from observation.
         
         Args:
-            X: Feature matrix (n_samples, n_features) or DataFrame
-            y: Target labels (n_samples,) - must be encoded as:
-               - 3-class: 0=sell, 1=hold, 2=buy
-               - Binary: 0=sell, 1=buy (hold signals come from low confidence)
-            **kwargs: Additional training parameters (ignored)
+            observation: Feature vector from DAG
+            portfolio_state: Dict of portfolio metrics
+            bar_index: Bar counter since block start
         
         Returns:
-            self for chaining
+            Tuple of (action, conviction)
+            action: TradingAction enum
+            conviction: float in [0, 1]
         """
-        if y is None:
-            raise ValueError(
-                "y (target labels) is required. "
-                "Provide pre-computed target derived timeseries in DSL."
-            )
-        
-        X_arr = self._to_numpy(X)
-        y_arr = self._to_numpy(y)
-        
-        if len(X_arr) != len(y_arr):
-            min_len = min(len(X_arr), len(y_arr))
-            X_arr = X_arr[:min_len]
-            y_arr = y_arr[:min_len]
-        
-        if len(X_arr) == 0:
-            raise ValueError("No training samples provided")
-        
-        unique_classes = np.unique(y_arr)
-        if len(unique_classes) > self.n_classes:
-            raise ValueError(
-                f"Found {len(unique_classes)} unique classes in y, "
-                f"but model configured for {self.n_classes} classes"
-            )
-        
-        self.model.fit(X_arr, y_arr)
-        self.is_trained = True
-        
-        return self
+        pass
     
-    def predict(self, X: Union[np.ndarray, pd.DataFrame, pd.Series], 
-                **kwargs) -> Dict[str, Any]:
-        """
-        Predict trading action from features.
-        
-        Args:
-            X: Feature vector (1, n_features) or DataFrame
-            **kwargs: Additional parameters (ignored)
-        
-        Returns:
-            dict with keys:
-                action: 'buy', 'sell', or 'hold'
-                confidence: probability of predicted class
-                proba_sell: probability of sell class
-                proba_hold: probability of hold class (0 for binary)
-                proba_buy: probability of buy class
-        """
-        if not self.is_trained:
-            return self._hold_output(confidence=0.0)
-        
-        X_arr = self._to_numpy(X)
-        
-        if X_arr.ndim == 1:
-            X_arr = X_arr.reshape(1, -1)
-        
-        if X_arr.shape[0] == 0:
-            return self._hold_output(confidence=0.0)
-        
-        proba = self.model.predict_proba(X_arr)[0]
-        
-        return self._build_output(proba)
+    @abstractmethod
+    def record_experience(
+        self,
+        observation: np.ndarray,
+        portfolio_state: Dict[str, float],
+        action: TradingAction,
+        conviction: float,
+        reward: float,
+        next_observation: np.ndarray,
+        next_portfolio_state: Dict[str, float],
+        done: bool
+    ) -> None:
+        """Record experience in replay buffer."""
+        pass
     
-    def predict_proba(self, X: Union[np.ndarray, pd.DataFrame]) -> np.ndarray:
-        """
-        Get class probabilities without thresholding.
-        
-        Args:
-            X: Feature matrix
-            
-        Returns:
-            Array of shape (n_samples, n_classes) with probabilities
-        """
-        if not self.is_trained:
-            n_classes = self.n_classes
-            return np.ones((1, n_classes)) / n_classes
-        
-        X_arr = self._to_numpy(X)
-        if X_arr.ndim == 1:
-            X_arr = X_arr.reshape(1, -1)
-        
-        return self.model.predict_proba(X_arr)
+    @abstractmethod
+    def update_policy(self, bar_index: int) -> None:
+        """Update policy using replay buffer."""
+        pass
     
-    def get_feature_importances(self) -> Optional[np.ndarray]:
-        """
-        Get feature importances from the tree.
-        
-        Returns:
-            Array of feature importances or None if not trained
-        """
-        if not self.is_trained:
-            return None
-        return self.model.feature_importances_
+    @abstractmethod
+    def save_checkpoint(self, path: str) -> None:
+        """Save agent state."""
+        pass
     
-    def get_tree_depth(self) -> Optional[int]:
-        """
-        Get the depth of the trained tree.
-        
-        Returns:
-            Tree depth or None if not trained
-        """
-        if not self.is_trained:
-            return None
-        return self.model.get_depth()
+    @abstractmethod
+    def load_checkpoint(self, path: str) -> None:
+        """Load agent state."""
+        pass
     
-    def get_n_leaves(self) -> Optional[int]:
-        """
-        Get the number of leaf nodes in the tree.
-        
-        Returns:
-            Number of leaves or None if not trained
-        """
-        if not self.is_trained:
-            return None
-        return self.model.get_n_leaves()
+    @property
+    @abstractmethod
+    def is_trained(self) -> bool:
+        """True after at least one policy update."""
+        pass
     
-    def save_state(self, path: Union[str, Path]):
+    def should_update(self, bar_index: int, recent_performance: float = 0.0) -> bool:
         """
-        Save model state to disk:
-            path:.
+        Determine if policy should update.
         
-        Args File path to save model
+        Override for custom update schedules.
+        Default: every_n_bars behavior.
         """
-        path = Path(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        
-        state = {
-            'model': self.model,
-            'is_trained': self.is_trained,
-            'params': {
-                'max_depth': self.max_depth,
-                'min_samples_split': self.min_samples_split,
-                'min_samples_leaf': self.min_samples_leaf,
-                'criterion': self.criterion,
-                'class_weight': self.class_weight,
-                'confidence_threshold': self.confidence_threshold,
-                'random_state': self.random_state,
-                'n_classes': self.n_classes
-            }
-        }
-        
-        with open(path, 'wb') as f:
-            pickle.dump(state, f)
+        return False
+
+
+class ReplayBuffer(ABC):
+    """Section 10.7: Experience replay buffer interface."""
     
-    def load_state(self, path: Union[str, Path]):
-        """
-        Load model state from disk.
-        
-        Args:
-            path: File path to load model from
-        """
-        path = Path(path)
-        
-        if not path.exists():
-            raise FileNotFoundError(f"Model file not found: {path}")
-        
-        with open(path, 'rb') as f:
-            state = pickle.load(f)
-        
-        self.model = state['model']
-        self.is_trained = state['is_trained']
-        
-        for key, value in state['params'].items():
-            setattr(self, key, value)
+    @abstractmethod
+    def add(
+        self,
+        observation: np.ndarray,
+        portfolio_state: Dict[str, float],
+        action: TradingAction,
+        conviction: float,
+        reward: float,
+        next_observation: np.ndarray,
+        next_portfolio_state: Dict[str, float],
+        done: bool
+    ) -> None:
+        """Add experience to buffer."""
+        pass
     
-    def _to_numpy(self, X: Union[np.ndarray, pd.DataFrame, pd.Series]) -> np.ndarray:
-        """Convert input to numpy array."""
-        if isinstance(X, pd.DataFrame):
-            return X.values
-        elif isinstance(X, pd.Series):
-            return X.values
-        elif isinstance(X, np.ndarray):
-            return X
-        else:
-            return np.array(X)
+    @abstractmethod
+    def sample(self, batch_size: int) -> List[Dict]:
+        """Sample batch of experiences."""
+        pass
     
-    def _build_output(self, proba: np.ndarray) -> Dict[str, Any]:
-        """Build output dict from probabilities."""
-        n_proba = len(proba)
-        
-        if n_proba == 1:
-            proba_sell = 1.0 if self.n_classes == 2 else 0.0
-            proba_hold = 0.0
-            proba_buy = 0.0 if self.n_classes == 2 else 1.0
-            pred_class = 0 if self.n_classes == 2 else 1
-        else:
-            proba_sell = float(proba[0])
-            proba_buy = float(proba[-1])
-            proba_hold = float(proba[1]) if n_proba > 2 and self.n_classes == 3 else 0.0
-            pred_class = np.argmax(proba)
-        
-        confidence = float(proba[pred_class])
-        
-        action_map = self.ACTION_MAP_BINARY if self.n_classes == 2 else self.ACTION_MAP_3CLASS
-        
-        if confidence < self.confidence_threshold:
-            action = 'hold'
-        else:
-            action = action_map.get(pred_class, 'hold')
-        
-        return {
-            'action': action,
-            'confidence': confidence,
-            'proba_sell': proba_sell,
-            'proba_hold': proba_hold,
-            'proba_buy': proba_buy
-        }
+    @abstractmethod
+    def clear(self) -> None:
+        """Clear buffer (for block boundaries)."""
+        pass
     
-    def _hold_output(self, confidence: float) -> Dict[str, Any]:
-        """Return hold output (for untrained model or empty input)."""
-        return {
-            'action': 'hold',
-            'confidence': confidence,
-            'proba_sell': 0.0,
-            'proba_hold': 1.0,
-            'proba_buy': 0.0
-        }
-    
-    def __repr__(self) -> str:
-        return (
-            f"DecisionTreeModel("
-            f"max_depth={self.max_depth}, "
-            f"n_classes={self.n_classes}, "
-            f"trained={self.is_trained})"
-        )
+    @abstractmethod
+    def __len__(self) -> int:
+        """Current buffer size."""
+        pass
+
+
+# Model registry
+MODEL_REGISTRY: Dict[str, ModelSpec] = {}
+
+
+def register_model(name: str, model_cls: type, description: str = "") -> None:
+    """Register a model class."""
+    MODEL_REGISTRY[name] = ModelSpec(cls=model_cls, description=description)
+
+
+def get_model(name: str) -> Optional[type]:
+    """Get model class by name."""
+    spec = MODEL_REGISTRY.get(name)
+    return spec.cls if spec else None

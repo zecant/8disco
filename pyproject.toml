@@ -2,9 +2,14 @@
 requires = ["setuptools==67.8.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
+[tool.pytest.ini_options]
+markers = [
+    "integration: marks tests as integration tests (deselect with '-m \"not integration\"')",
+]
+
 [project]
 name = "tradsl"
-version = "0.0.2"
+version = "0.0.02"
 description = "A domain-specific configuration language for trading systems"
 readme = "README.md"
 authors = [
@@ -13,6 +18,11 @@ authors = [
 dependencies = [
     "pandas",
     "numpy",
+    "pytest>=7.0.0",
+    "yfinance",
+    "scikit-learn",
+    "joblib",
+    "nautilus-trader",
 ]
 requires-python = ">=3.8"
 license = { file = "LICENSE" }
