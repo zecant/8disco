@@ -14,15 +14,16 @@ logger = logging.getLogger("tradsl.agent_framework")
 from tradsl.models import BaseAgentArchitecture, TradingAction, ReplayBuffer
 from tradsl.training import ReplayBuffer as TrainingReplayBuffer, Experience
 
-MIN_EXPERIENCES_FOR_UPDATE = 8
-MIN_BUFFER_FOR_UPDATE = 32
+MIN_EXPERIENCES_FOR_UPDATE = 4
+MIN_BUFFER_FOR_UPDATE = 8
 
 
 class PPOUpdate:
     """
-    PPO-style policy update algorithm.
+    PPO (Proximal Policy Optimization) policy update algorithm.
     
-    Implements clipped surrogate objective with value function.
+    Implements clipped surrogate objective with value function as per
+    "Proximal Policy Optimization Algorithms" (Schulman et al., 2017).
     """
     
     def __init__(
@@ -40,6 +41,7 @@ class PPOUpdate:
         self.learning_rate = learning_rate
         self.gamma = gamma
         self.lam = lam
+        self._old_log_probs = None
     
     def update(
         self,
@@ -48,7 +50,7 @@ class PPOUpdate:
         value_model
     ) -> Dict[str, float]:
         """
-        Perform PPO update.
+        Perform PPO update with clipped surrogate objective.
         
         Args:
             experiences: List of Experience tuples
@@ -71,6 +73,8 @@ class PPOUpdate:
         returns = self._compute_returns(rewards)
         advantages = self._compute_advantages(rewards, values, dones)
         
+        advantages = (advantages - np.mean(advantages)) / (np.std(advantages) + 1e-8)
+        
         if hasattr(policy_model, 'predict') and len(states) > 0:
             try:
                 all_logits = []
@@ -86,30 +90,73 @@ class PPOUpdate:
         else:
             action_logits = np.zeros((len(states), 4))
         
-        policy_loss = 0.0
-        entropy = 0.0
-        value_loss = 0.0
-        
         old_log_probs = self._compute_log_probs(action_logits, actions)
+        self._old_log_probs = old_log_probs.copy()
         
-        for i, exp in enumerate(experiences):
-            advantage = advantages[i]
-            log_prob = old_log_probs[i]
-            
-            policy_loss -= log_prob * advantage
-            entropy += 0.5 * (np.exp(log_prob) * log_prob).sum()
+        policy_loss, entropy = self._compute_ppo_loss(action_logits, actions, advantages, old_log_probs)
         
-        policy_loss /= len(experiences)
+        value_loss = self._compute_value_loss(values[:-1], returns)
         
-        policy_loss = max(0.0, float(policy_loss))
+        total_loss = policy_loss + self.value_coef * value_loss - self.entropy_coef * entropy
         
         return {
-            'loss': policy_loss + self.value_coef * value_loss - self.entropy_coef * entropy,
-            'policy_loss': policy_loss,
-            'value_loss': value_loss,
+            'loss': float(total_loss),
+            'policy_loss': float(policy_loss),
+            'value_loss': float(value_loss),
             'entropy': float(entropy),
-            'mean_advantage': float(np.mean(advantages))
+            'mean_advantage': float(np.mean(advantages)),
+            'clip_frac': float(self._compute_clip_fraction(action_logits, actions, advantages, old_log_probs))
         }
+    
+    def _compute_ppo_loss(
+        self,
+        logits: np.ndarray,
+        actions: np.ndarray,
+        advantages: np.ndarray,
+        old_log_probs: np.ndarray
+    ) -> tuple:
+        """Compute PPO clipped surrogate objective loss."""
+        probs = self._softmax(logits)
+        new_log_probs = self._compute_log_probs(logits, actions)
+        
+        ratios = np.exp(new_log_probs - old_log_probs)
+        
+        surr1 = ratios * advantages
+        surr2 = np.clip(ratios, 1 - self.clip_epsilon, 1 + self.clip_epsilon) * advantages
+        
+        policy_loss = -np.mean(np.minimum(surr1, surr2))
+        
+        entropy = -np.sum(probs * np.log(probs + 1e-8), axis=1).mean()
+        
+        return policy_loss, entropy
+    
+    def _compute_clip_fraction(
+        self,
+        logits: np.ndarray,
+        actions: np.ndarray,
+        advantages: np.ndarray,
+        old_log_probs: np.ndarray
+    ) -> float:
+        """Compute fraction of experiences that were clipped."""
+        if self._old_log_probs is None:
+            return 0.0
+        
+        new_log_probs = self._compute_log_probs(logits, actions)
+        ratios = np.exp(new_log_probs - old_log_probs)
+        
+        clipped = np.abs(ratios - 1.0) > self.clip_epsilon
+        return np.mean(clipped)
+    
+    def _compute_value_loss(self, values: np.ndarray, returns: np.ndarray) -> float:
+        """Compute value function loss (MSE between predicted values and returns)."""
+        if len(values) == 0 or len(returns) == 0:
+            return 0.0
+        return np.mean((values - returns) ** 2)
+    
+    def _softmax(self, x: np.ndarray) -> np.ndarray:
+        """Compute softmax probabilities."""
+        exp_x = np.exp(x - np.max(x, axis=-1, keepdims=True))
+        return exp_x / np.sum(exp_x, axis=-1, keepdims=True)
     
     def _compute_returns(self, rewards: np.ndarray) -> np.ndarray:
         """Compute discounted returns."""
@@ -656,22 +703,18 @@ class ParameterizedAgent(BaseAgentArchitecture):
                     done=exp['done']
                 ))
         
-        result = self._algorithm.update(
-            experiences,
-            self.policy_model,
-            self.value_model
-        )
-        
-        self._apply_policy_update(experiences, result)
+        self._apply_policy_update(experiences)
         
         self._is_trained = True
         self._update_count += 1
     
-    def _apply_policy_update(self, experiences: List[Experience], result: Dict[str, float]) -> None:
-        """Apply gradient update to policy model.
+    def _apply_policy_update(self, experiences: List[Experience]) -> None:
+        """
+        Apply gradient update to policy model.
         
-        For sklearn models, uses partial_fit with sample weights.
-        For models with native gradient support, applies gradients directly.
+        For sklearn models, uses partial_fit with sample weights derived from
+        rewards. This is a simplified policy gradient suitable for 
+        RandomForest/LinearModel policies.
         """
         if not experiences or len(experiences) < MIN_BUFFER_FOR_UPDATE:
             return
@@ -727,8 +770,11 @@ class ParameterizedAgent(BaseAgentArchitecture):
         return False
     
     def save_checkpoint(self, path: str) -> None:
-        """Save agent state."""
+        """Save agent state atomically."""
         import os
+        import joblib
+        import tempfile
+        
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         
         base_path = path.replace('.joblib', '')
@@ -742,6 +788,7 @@ class ParameterizedAgent(BaseAgentArchitecture):
             self.value_model.save_checkpoint(value_path)
         
         state = {
+            'version': 1,
             'is_trained': self._is_trained,
             'bar_index': self._bar_index,
             'update_count': self._update_count,
@@ -751,8 +798,9 @@ class ParameterizedAgent(BaseAgentArchitecture):
             'seed': self.seed
         }
         
-        import joblib
-        joblib.dump(state, path)
+        tmp_path = path + '.tmp'
+        joblib.dump(state, tmp_path)
+        os.rename(tmp_path, path)
     
     def load_checkpoint(self, path: str) -> None:
         """Load agent state."""

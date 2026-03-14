@@ -7,6 +7,7 @@ See Section 6 of the specification.
 """
 from typing import Any, Dict, List, Set, Optional
 from collections import deque
+import heapq
 from dataclasses import dataclass, field
 from tradsl.exceptions import CycleError, ConfigError
 
@@ -141,7 +142,7 @@ def _check_cycles(nodes: Dict[str, Dict], edges: Dict[str, List[str]]) -> None:
 
 def _topological_sort(nodes: Dict[str, Dict], reverse_edges: Dict[str, List[str]]) -> List[str]:
     """
-    Topological sort using Kahn's algorithm with deque.
+    Topological sort using Kahn's algorithm with O(V+E) complexity.
 
     Stable sort: nodes with same in-degree are processed alphabetically.
     
@@ -149,24 +150,29 @@ def _topological_sort(nodes: Dict[str, Dict], reverse_edges: Dict[str, List[str]
         nodes: Dict of node name -> node config
         reverse_edges: Dict mapping node -> its dependencies (nodes it depends on)
     """
+    import heapq
+    
     in_degree = {name: len(reverse_edges.get(name, [])) for name in nodes}
-
-    queue = deque([name for name, deg in in_degree.items() if deg == 0])
-    queue = deque(sorted(queue))
-
+    
+    forward_edges = {name: [] for name in nodes}
+    for node, deps in reverse_edges.items():
+        for dep in deps:
+            if dep in forward_edges:
+                forward_edges[dep].append(node)
+    
+    heap = [name for name, deg in in_degree.items() if deg == 0]
+    heapq.heapify(heap)
+    
     result = []
 
-    while queue:
-        node = queue.popleft()
+    while heap:
+        node = heapq.heappop(heap)
         result.append(node)
-
-        for dependent in nodes:
-            if node in reverse_edges.get(dependent, []):
-                in_degree[dependent] -= 1
-                if in_degree[dependent] == 0:
-                    queue.append(dependent)
-        if queue:
-            queue = deque(sorted(queue))
+        
+        for dependent in forward_edges.get(node, []):
+            in_degree[dependent] -= 1
+            if in_degree[dependent] == 0:
+                heapq.heappush(heap, dependent)
 
     if len(result) != len(nodes):
         remaining = [n for n in nodes if n not in result]

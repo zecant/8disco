@@ -9,22 +9,9 @@ import pandas as pd
 from datetime import datetime
 import logging
 
+from tradsl.exceptions import AdapterError, SymbolNotFound, DateRangeTruncated
+
 logger = logging.getLogger("tradsl.adapters")
-
-
-class AdapterError(Exception):
-    """Base exception for adapter errors."""
-    pass
-
-
-class SymbolNotFound(AdapterError):
-    """Requested symbol not found."""
-    pass
-
-
-class DateRangeTruncated(AdapterError):
-    """Requested date range partially unavailable."""
-    pass
 
 
 class BaseAdapter(ABC):

@@ -27,6 +27,7 @@ class TrainingPortfolio:
         self.entry_price = 0.0
         self.commission_rate = commission_rate
         self.bars_in_position = 0
+        self.realized_pnl = 0.0
     
     def on_action(
         self,
@@ -55,7 +56,11 @@ class TrainingPortfolio:
         elif action == TradingAction.SELL and quantity > 0:
             proceeds = quantity * price
             commission = proceeds * self.commission_rate
-            self.cash += (proceeds - commission)
+            net_proceeds = proceeds - commission
+            if self.entry_price > 0:
+                pnl = (price - self.entry_price) * quantity - commission
+                self.realized_pnl += pnl
+            self.cash += net_proceeds
             self.position -= quantity
             if self.position == 0:
                 self.entry_price = 0.0
@@ -64,7 +69,11 @@ class TrainingPortfolio:
             quantity = abs(self.position)
             proceeds = quantity * price
             commission = proceeds * self.commission_rate
-            self.cash += (proceeds - commission)
+            net_proceeds = proceeds - commission
+            if self.entry_price > 0:
+                pnl = (price - self.entry_price) * quantity - commission
+                self.realized_pnl += pnl
+            self.cash += net_proceeds
             self.position = 0.0
             self.entry_price = 0.0
             self.bars_in_position = 0
@@ -87,17 +96,21 @@ class TrainingPortfolio:
         
         return commission
     
-    def get_state(self) -> Dict[str, float]:
-        """Get current portfolio state dict."""
+    def get_state(self, current_price: float = 0.0) -> Dict[str, float]:
+        """Get current portfolio state dict.
+        
+        Args:
+            current_price: Current market price for unrealized PnL calculation.
+        """
         unrealized_pnl = 0.0
-        if self.position != 0 and self.entry_price > 0:
-            unrealized_pnl = self.position * (self.entry_price - 0)
+        if self.position != 0 and self.entry_price > 0 and current_price > 0:
+            unrealized_pnl = self.position * (current_price - self.entry_price)
         
         return {
             'portfolio_value': self.portfolio_value,
             'position': self.position,
             'unrealized_pnl': unrealized_pnl,
-            'realized_pnl': 0.0,
+            'realized_pnl': self.realized_pnl,
             'drawdown': self.drawdown,
             'high_water_mark': self.high_water_mark,
             'bars_in_trade': self.bars_in_position
@@ -491,7 +504,7 @@ class BlockTrainer:
             
             if prev_observation is not None and prev_action is not None and prev_portfolio_state is not None:
                 commission = portfolio.on_action(current_action, quantity, current_price)
-                current_portfolio_state = portfolio.get_state()
+                current_portfolio_state = portfolio.get_state(current_price)
                 
                 if hasattr(self.reward_function, 'compute'):
                     from tradsl.rewards import RewardContext
@@ -527,9 +540,13 @@ class BlockTrainer:
             
             prev_observation = current_observation
             prev_action = current_action
-            prev_portfolio_state = portfolio.get_state()
+            prev_portfolio_state = portfolio.get_state(current_price)
             
-            if relative_idx >= warmup_bars and hasattr(self.agent, 'should_update'):
+            # Note: warmup_bars is DAG warmup (for indicators), but within a block
+            # relative_idx starts from 0. We use a small training warmup (10 bars)
+            # to allow collecting experiences before first policy update.
+            training_warmup = 10
+            if relative_idx >= training_warmup and hasattr(self.agent, 'should_update'):
                 if self.agent.should_update(
                     relative_idx,
                     recent_performance=portfolio_state.get('rolling_sharpe', 0.0)
@@ -585,7 +602,9 @@ class WalkForwardTester:
             portfolio_value = portfolio_state.get('portfolio_value', portfolio_value)
             equity_curve.append(portfolio_value)
             
-            if relative_idx >= warmup_bars and hasattr(self.agent, 'should_update'):
+            # Use small training warmup (10 bars) to allow policy updates during test
+            training_warmup = 10
+            if relative_idx >= training_warmup and hasattr(self.agent, 'should_update'):
                 if self.agent.should_update(
                     relative_idx,
                     portfolio_state.get('rolling_sharpe', 0.0)

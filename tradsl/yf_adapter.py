@@ -247,14 +247,18 @@ class YFinanceAdapter(BaseAdapter):
         
         if actual_start > requested_start + start_buffer:
             raise DateRangeTruncated(
-                f"Symbol {symbol}: requested start {requested_start.date()} "
-                f"but data begins {actual_start.date()}"
+                requested_start,
+                requested_end,
+                actual_start,
+                actual_end
             )
         
         if actual_end < requested_end - end_buffer:
             raise DateRangeTruncated(
-                f"Symbol {symbol}: requested end {requested_end.date()} "
-                f"but data ends {actual_end.date()}"
+                requested_start,
+                requested_end,
+                actual_start,
+                actual_end
             )
     
     def supports_frequency(self, frequency: str) -> bool:

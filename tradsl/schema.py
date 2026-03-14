@@ -75,6 +75,8 @@ BLOCK_SCHEMAS: Dict[str, Dict[str, FieldSpec]] = {
         'tradable': FieldSpec(type=list, required=True),
         'sizer': FieldSpec(type=str, required=True),
         'sizer_params': FieldSpec(type=str, required=False),
+        'update_schedule': FieldSpec(type=str, required=False, allowed_values={'every_n_bars', 'performance_degradation'}, default='every_n_bars'),
+        'update_n': FieldSpec(type=int, required=False, default=10),
     },
     'adapter': {
         'type': FieldSpec(type=str, required=True, allowed_values={'adapter'}),

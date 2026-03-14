@@ -68,6 +68,32 @@ _registry: Dict[str, Dict[str, Any]] = {
     'rewards': {},
 }
 
+# Auto-register built-in label functions
+from tradsl.labels import LABEL_REGISTRY
+for name, spec in LABEL_REGISTRY.items():
+    _registry['label_functions'][name] = {
+        'func': spec.func,
+        'description': spec.description,
+        'requires_future_bars': spec.requires_future_bars
+    }
+
+# Auto-register built-in adapters
+from tradsl.adapters import BaseAdapter
+from tradsl.yf_adapter import YFinanceAdapter
+from tradsl.testdata_adapter import TestDataAdapter
+_registry['adapters']['tradsl.adapters.YFinanceAdapter'] = YFinanceAdapter
+_registry['adapters']['tradsl.testdata_adapter.TestDataAdapter'] = TestDataAdapter
+_registry['adapters']['yf'] = YFinanceAdapter
+_registry['adapters']['test_adapter'] = TestDataAdapter
+
+# Auto-register built-in sizers
+_registry['sizers']['fractional'] = FractionalSizer
+_registry['sizers']['fixed'] = FixedSizer
+_registry['sizers']['kelly'] = KellySizer
+_registry['sizers']['volatility_targeting'] = VolatilityTargetingSizer
+_registry['sizers']['max_drawdown'] = MaxDrawdownSizer
+_registry['sizers']['ensemble'] = EnsembleSizer
+
 
 @dataclass
 class ValidationResult:
@@ -197,6 +223,99 @@ def load(dsl_string: str, context: Optional[Dict[str, Any]] = None) -> Validatio
     )
 
 
+def _load_data_from_adapters(
+    resolved: Dict[str, Any],
+    backtest_config: Dict[str, Any]
+) -> Optional[np.ndarray]:
+    """
+    Automatically load data from adapters defined in DSL.
+    
+    Args:
+        resolved: Resolved configuration with adapter instances
+        backtest_config: Backtest configuration with date range
+    
+    Returns:
+        numpy array of shape (n_bars, n_features) or None if loading fails
+    """
+    from datetime import datetime
+    
+    start = backtest_config.get('start', '2024-01-01')
+    end = backtest_config.get('end', '2024-12-31')
+    interval = '1d'
+    
+    try:
+        start_date = datetime.strptime(start, '%Y-%m-%d')
+        end_date = datetime.strptime(end, '%Y-%m-%d')
+    except (ValueError, TypeError):
+        return None
+    
+    # Find all timeseries blocks with adapters
+    timeseries_blocks = {}
+    for name, block in resolved.items():
+        if isinstance(block, dict) and block.get('type') == 'timeseries':
+            adapter_class = block.get('_adapter')
+            if adapter_class is not None:
+                params = block.get('parameters', [])
+                if params:
+                    timeseries_blocks[name] = {
+                        'adapter_class': adapter_class,
+                        'symbol': params[0] if params else None,
+                        'tradable': block.get('tradable', False),
+                        'interval': block.get('interval', '1d')
+                    }
+    
+    if not timeseries_blocks:
+        return None
+    
+    # Load data from adapters
+    data_arrays = {}
+    for name, info in timeseries_blocks.items():
+        adapter_class = info['adapter_class']
+        symbol = info['symbol']
+        interval = info.get('interval', '1d')
+        
+        try:
+            # Instantiate adapter with interval
+            if isinstance(adapter_class, type):
+                adapter = adapter_class(interval=interval)
+            else:
+                adapter = adapter_class
+            
+            df = adapter.load_historical(symbol, start_date, end_date, interval)
+            if df is not None and len(df) > 0:
+                # Use close price as primary feature
+                data_arrays[name] = df['close'].values
+        except Exception as e:
+            logger.warning(f"Failed to load {symbol}: {e}")
+            continue
+    
+    if not data_arrays:
+        return None
+    
+    # Find the tradable symbol (primary) and combine all data
+    primary_name = None
+    for name, info in timeseries_blocks.items():
+        if info['tradable'] and name in data_arrays:
+            primary_name = name
+            break
+    
+    if primary_name is None:
+        primary_name = list(data_arrays.keys())[0]
+    
+    # Get minimum length
+    min_len = min(len(arr) for arr in data_arrays.values())
+    
+    # Combine all arrays - primary symbol close is first, then others
+    combined = []
+    combined.append(data_arrays[primary_name][:min_len])
+    
+    for name, arr in data_arrays.items():
+        if name != primary_name:
+            combined.append(arr[:min_len])
+    
+    return np.column_stack(combined)
+
+
 def train(
     dsl_string: str,
     context: Optional[Dict[str, Any]] = None,
@@ -229,16 +348,21 @@ def train(
     dag = build_dag(resolved)
 
     backtest_config = resolved.get('_backtest', {})
-    training_config_dict = resolved.get('_training', {})
+    
+    # If no data provided, automatically load from adapters in DSL
+    if data is None:
+        data = _load_data_from_adapters(resolved, backtest_config)
+        if data is None:
+            raise ValueError("Could not automatically load data from adapters. Please provide data array.")
 
     training_config = TrainingConfig(
-        training_window=training_config_dict.get('training_window', 504),
-        retrain_schedule=training_config_dict.get('retrain_schedule', 'every_n_bars'),
-        retrain_n=training_config_dict.get('retrain_n', 252),
-        n_training_blocks=training_config_dict.get('n_training_blocks', 40),
-        block_size_min=training_config_dict.get('block_size_min', 30),
-        block_size_max=training_config_dict.get('block_size_max', 120),
-        seed=training_config_dict.get('seed', 42)
+        training_window=backtest_config.get('training_window', 504),
+        retrain_schedule=backtest_config.get('retrain_schedule', 'every_n_bars'),
+        retrain_n=backtest_config.get('retrain_n', 252),
+        n_training_blocks=backtest_config.get('n_training_blocks', 40),
+        block_size_min=backtest_config.get('block_size_min', 30),
+        block_size_max=backtest_config.get('block_size_max', 120),
+        seed=backtest_config.get('seed', 42)
     )
 
     if data is None:
@@ -255,11 +379,34 @@ def train(
     n_estimators = model_config.get('params', {}).get('n_estimators', 10) if model_config.get('params') else 10
     replay_buffer_size = model_config.get('replay_buffer_size', 4096)
     
-    policy = RandomForestModel(n_estimators=n_estimators, random_state=training_config.seed)
+    model_class_name = model_config.get('class')
+    policy_model_class = None
+    if model_class_name:
+        policy_model_class = _registry.get('trainable_models', {}).get(model_class_name)
+        if policy_model_class is None:
+            policy_model_class = _registry.get('agents', {}).get(model_class_name)
+    
+    if policy_model_class is None:
+        from tradsl.models_impl import RandomForestModel
+        policy_model_class = RandomForestModel
+    
+    policy_params = model_config.get('params', {})
+    if 'class' not in policy_params:
+        policy_params['random_state'] = training_config.seed
+    policy = policy_model_class(**policy_params)
+    
+    # Use retrain_n from model block if available, otherwise from training_config
+    agent_update_n = model_config.get('retrain_n', training_config.retrain_n)
+    # Also check agent config for update_n (takes priority)
+    agent_update_n = agent_config.get('update_n', agent_update_n)
+    
+    # Use update_schedule from agent config, or fall back to model block, then training_config
+    agent_update_schedule = agent_config.get('update_schedule', training_config.retrain_schedule)
+    
     agent = ParameterizedAgent(
         policy_model=policy,
-        update_schedule=training_config.retrain_schedule,
-        update_n=training_config.retrain_n,
+        update_schedule=agent_update_schedule,
+        update_n=agent_update_n,
         replay_buffer_size=replay_buffer_size,
         seed=training_config.seed
     )
@@ -274,7 +421,18 @@ def train(
     sizer_class = _registry.get('sizers', {}).get(sizer_name)
     if sizer_class is None:
         sizer_class = KellySizer
-    sizer = sizer_class()
+    
+    # Get sizer params from agent config
+    sizer_params_name = agent_config.get('sizer_params')
+    sizer_params = {}
+    if sizer_params_name and sizer_params_name in resolved:
+        sizer_params = resolved[sizer_params_name]
+    
+    # Create sizer with params if provided
+    if sizer_params:
+        sizer = sizer_class(**sizer_params)
+    else:
+        sizer = sizer_class()
 
     trainable_models = {}
     for name, block in resolved.items():
@@ -322,7 +480,7 @@ def train(
             }
             current_position = 0.0
         else:
-            portfolio_state = portfolio.get_state()
+            portfolio_state = portfolio.get_state(current_price)
             current_position = portfolio.position
         
         observation = bar_data
@@ -389,6 +547,12 @@ def test(
     resolved = resolve(validated, context)
 
     backtest_config = resolved.get('_backtest', {})
+    
+    # If no data provided, automatically load from adapters in DSL
+    if data is None:
+        data = _load_data_from_adapters(resolved, backtest_config)
+        if data is None:
+            raise ValueError("Could not automatically load data from adapters. Please provide data array.")
     test_start = backtest_config.get('test_start', '2022-01-01')
     model_config = resolved.get('model', {})
     agent_config = resolved.get('agent', {})
@@ -431,15 +595,20 @@ def test(
     def execute_bar_fn(bar_idx, bar_data, portfolio=None):
         current_price = float(bar_data[-1]) if len(bar_data) > 0 else 100.0
         
-        portfolio_state = {
-            'portfolio_value': engine.portfolio_value,
-            'position': engine.position,
-            'unrealized_pnl': 0.0,
-            'realized_pnl': 0.0,
-            'drawdown': engine.drawdown,
-            'high_water_mark': engine.high_water_mark,
-            'bars_in_trade': 0
-        }
+        if portfolio is not None:
+            portfolio_state = portfolio.get_state(current_price)
+            current_position = portfolio.position
+        else:
+            portfolio_state = {
+                'portfolio_value': engine.portfolio_value,
+                'position': engine.position,
+                'unrealized_pnl': 0.0,
+                'realized_pnl': 0.0,
+                'drawdown': engine.drawdown,
+                'high_water_mark': engine.high_water_mark,
+                'bars_in_trade': 0
+            }
+            current_position = engine.position
         
         observation = bar_data
         
@@ -448,8 +617,8 @@ def test(
         quantity = sizer.calculate_size(
             action=action,
             conviction=conviction,
-            current_position=engine.position,
-            portfolio_value=engine.portfolio_value,
+            current_position=current_position,
+            portfolio_value=portfolio_state.get('portfolio_value', engine.portfolio_value),
             instrument_id=symbol,
             current_price=current_price
         )
@@ -459,8 +628,8 @@ def test(
             'quantity': quantity,
             'price': current_price,
             'symbol': symbol,
-            'portfolio_value': engine.portfolio_value,
-            'position': engine.position
+            'portfolio_value': portfolio_state.get('portfolio_value', engine.portfolio_value),
+            'position': current_position
         }
 
     test_start_idx = int(len(data) * 0.7)

@@ -261,15 +261,19 @@ class BacktestEngine:
         
         if side == "buy":
             self.portfolio_value -= (quantity * price + trade.commission + abs(trade.slippage))
-            if self.position == 0:
+            self.position += quantity
+            if self.position == quantity:
                 self.entry_price = price
                 self.entry_time = timestamp
         else:
             self.portfolio_value += (quantity * price - trade.commission - abs(trade.slippage))
             if self.position != 0:
-                pnl = (self.entry_price - price) * quantity if side == "sell" else (price - self.entry_price) * quantity
+                pnl = (price - self.entry_price) * quantity
                 trade.pnl = pnl - trade.commission - abs(trade.slippage)
-                self.position = 0
+            self.position -= quantity
+            if abs(self.position) < 1e-9:
+                self.position = 0.0
+                self.entry_price = 0.0
         
         self.trades.append(trade)
         
