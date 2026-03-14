@@ -13,7 +13,7 @@ markers = [
 
 [project]
 name = "tradsl"
-version = "0.0.02"
+version = "0.0.03"
 description = "A domain-specific configuration language for trading systems"
 readme = "README.md"
 authors = [
