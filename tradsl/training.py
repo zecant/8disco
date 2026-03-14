@@ -179,7 +179,7 @@ class BlockSampler:
     Section 14.4: Sample non-overlapping blocks from training pool.
     
     Algorithm:
-    1. Set RNG seed
+    1. Use isolated RNG instance
     2. Sample block sizes uniformly in [block_size_min, block_size_max]
     3. Verify total coverage ≤ 80% of pool
     4. Sample start positions, maintaining non-overlap
@@ -188,6 +188,7 @@ class BlockSampler:
     
     def __init__(self, config: TrainingConfig):
         self.config = config
+        self._rng = random.Random(config.seed)
     
     def sample_blocks(
         self,
@@ -206,8 +207,6 @@ class BlockSampler:
         Returns:
             List of Block objects, sorted by start_idx
         """
-        random.seed(self.config.seed)
-        
         pool_length = pool_end_idx - pool_start_idx
         max_coverage = int(pool_length * MAX_BLOCK_COVERAGE)
         
@@ -215,7 +214,7 @@ class BlockSampler:
         available_start = pool_start_idx
         
         for _ in range(self.config.n_training_blocks):
-            block_size = random.randint(
+            block_size = self._rng.randint(
                 self.config.block_size_min,
                 self.config.block_size_max
             )
@@ -256,6 +255,7 @@ class Experience:
     next_observation: np.ndarray
     done: bool
     priority: float = 1.0
+    log_prob: float = 0.0
 
 
 class ReplayBuffer:
@@ -602,14 +602,7 @@ class WalkForwardTester:
             portfolio_value = portfolio_state.get('portfolio_value', portfolio_value)
             equity_curve.append(portfolio_value)
             
-            # Use small training warmup (10 bars) to allow policy updates during test
-            training_warmup = 10
-            if relative_idx >= training_warmup and hasattr(self.agent, 'should_update'):
-                if self.agent.should_update(
-                    relative_idx,
-                    portfolio_state.get('rolling_sharpe', 0.0)
-                ):
-                    self.agent.update_policy(relative_idx)
+            # NO policy updates in test mode - frozen model only
         
         return {
             'equity_curve': np.array(equity_curve),

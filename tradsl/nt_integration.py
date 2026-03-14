@@ -322,6 +322,13 @@ class TradSLNTStrategy:
         self._state = ExecutionState()
         self._pending_fills: List[Dict] = []
         
+        self._node_to_symbol: Dict[str, str] = {}
+        for node_name, block in self._config.dag_config.items():
+            if isinstance(block, dict) and block.get('type') == 'timeseries':
+                params = block.get('parameters', [])
+                if params:
+                    self._node_to_symbol[node_name] = params[0]
+        
         self._init_buffers()
     
     def _init_buffers(self) -> None:
@@ -493,9 +500,16 @@ class TradSLNTStrategy:
         """Push bar OHLCV data to source node buffers."""
         close = float(bar.close)
         
+        instrument_id = str(bar.bar_type.instrument_id) if hasattr(bar, 'bar_type') else None
+        
         for node_name in self._config.source_nodes:
             if node_name in self._state.node_buffers:
-                self._state.node_buffers[node_name].push(close)
+                node_symbol = self._node_to_symbol.get(node_name)
+                if node_symbol and instrument_id:
+                    if node_symbol.upper() == instrument_id.upper() or node_symbol in instrument_id:
+                        self._state.node_buffers[node_name].push(close)
+                elif not node_symbol:
+                    self._state.node_buffers[node_name].push(close)
     
     def _recompute_dirty_nodes(self) -> None:
         """Recompute dirty nodes in topological order."""

@@ -237,7 +237,7 @@ def validate(raw: Dict[str, Any], function_registry: Optional[Dict[str, Any]] = 
 
     validated = raw.copy()
 
-    backtest = validated.get('backtest')
+    backtest = validated.get('_backtest') or validated.get('backtest')
     if backtest and backtest.get('date_blind', True):
         date_derived_errors = _validate_date_blind(timeseries_nodes, function_registry)
         if date_derived_errors:
@@ -248,8 +248,9 @@ def validate(raw: Dict[str, Any], function_registry: Optional[Dict[str, Any]] = 
         if name in raw:
             validated[name] = _fill_defaults(block, BLOCK_SCHEMAS.get(block.get('type', ''), {}))
 
-    if backtest and 'backtest' in validated:
-        validated['backtest'] = _fill_defaults(backtest, BLOCK_SCHEMAS.get('backtest', {}))
+    backtest_key = '_backtest' if '_backtest' in validated else 'backtest'
+    if backtest and backtest_key in validated:
+        validated[backtest_key] = _fill_defaults(backtest, BLOCK_SCHEMAS.get('backtest', {}))
 
     return validated
 

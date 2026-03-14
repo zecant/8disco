@@ -226,7 +226,7 @@ def load(dsl_string: str, context: Optional[Dict[str, Any]] = None) -> Validatio
 def _load_data_from_adapters(
     resolved: Dict[str, Any],
     backtest_config: Dict[str, Any]
-) -> Optional[np.ndarray]:
+) -> Optional[tuple]:
     """
     Automatically load data from adapters defined in DSL.
     
@@ -235,7 +235,7 @@ def _load_data_from_adapters(
         backtest_config: Backtest configuration with date range
     
     Returns:
-        numpy array of shape (n_bars, n_features) or None if loading fails
+        Tuple of (data array, dates array) or None if loading fails
     """
     from datetime import datetime
     
@@ -249,7 +249,6 @@ def _load_data_from_adapters(
     except (ValueError, TypeError):
         return None
     
-    # Find all timeseries blocks with adapters
     timeseries_blocks = {}
     for name, block in resolved.items():
         if isinstance(block, dict) and block.get('type') == 'timeseries':
@@ -267,15 +266,15 @@ def _load_data_from_adapters(
     if not timeseries_blocks:
         return None
     
-    # Load data from adapters
     data_arrays = {}
+    ohlcv_data = {}
+    primary_df = None
     for name, info in timeseries_blocks.items():
         adapter_class = info['adapter_class']
         symbol = info['symbol']
         interval = info.get('interval', '1d')
         
         try:
-            # Instantiate adapter with interval
             if isinstance(adapter_class, type):
                 adapter = adapter_class(interval=interval)
             else:
@@ -283,8 +282,16 @@ def _load_data_from_adapters(
             
             df = adapter.load_historical(symbol, start_date, end_date, interval)
             if df is not None and len(df) > 0:
-                # Use close price as primary feature
+                ohlcv_data[name] = {
+                    'open': df['open'].values if 'open' in df.columns else df['close'].values,
+                    'high': df['high'].values if 'high' in df.columns else df['close'].values,
+                    'low': df['low'].values if 'low' in df.columns else df['close'].values,
+                    'close': df['close'].values,
+                    'volume': df['volume'].values if 'volume' in df.columns else np.zeros(len(df)),
+                }
                 data_arrays[name] = df['close'].values
+                if info['tradable'] or primary_df is None:
+                    primary_df = df
         except Exception as e:
             logger.warning(f"Failed to load {symbol}: {e}")
             continue
@@ -292,7 +299,6 @@ def _load_data_from_adapters(
     if not data_arrays:
         return None
     
-    # Find the tradable symbol (primary) and combine all data
     primary_name = None
     for name, info in timeseries_blocks.items():
         if info['tradable'] and name in data_arrays:
@@ -302,10 +308,8 @@ def _load_data_from_adapters(
     if primary_name is None:
         primary_name = list(data_arrays.keys())[0]
     
-    # Get minimum length
     min_len = min(len(arr) for arr in data_arrays.values())
     
-    # Combine all arrays - primary symbol close is first, then others
     combined = []
     combined.append(data_arrays[primary_name][:min_len])
     
@@ -313,7 +317,11 @@ def _load_data_from_adapters(
         if name != primary_name:
             combined.append(arr[:min_len])
     
-    return np.column_stack(combined)
+    dates = None
+    if primary_df is not None:
+        dates = primary_df.index[:min_len].values
+    
+    return np.column_stack(combined), dates
 
 
 def train(
@@ -349,11 +357,11 @@ def train(
 
     backtest_config = resolved.get('_backtest', {})
     
-    # If no data provided, automatically load from adapters in DSL
     if data is None:
-        data = _load_data_from_adapters(resolved, backtest_config)
-        if data is None:
+        result = _load_data_from_adapters(resolved, backtest_config)
+        if result is None:
             raise ValueError("Could not automatically load data from adapters. Please provide data array.")
+        data, dates = result
 
     training_config = TrainingConfig(
         training_window=backtest_config.get('training_window', 504),
@@ -364,9 +372,6 @@ def train(
         block_size_max=backtest_config.get('block_size_max', 120),
         seed=backtest_config.get('seed', 42)
     )
-
-    if data is None:
-        raise ValueError("data array is required for training")
 
     from tradsl.models_impl import RandomForestModel
     from tradsl.rewards import AsymmetricHighWaterMarkReward
@@ -465,6 +470,100 @@ def train(
 
     capital = backtest_config.get('capital', 100000.0)
 
+    source_timeseries = {}
+    for name, block in resolved.items():
+        if isinstance(block, dict) and block.get('type') == 'timeseries':
+            if not block.get('inputs'):
+                source_timeseries[name] = block
+
+    ts_to_col = {}
+    col_idx = 0
+    primary_name = None
+    for name, block in source_timeseries.items():
+        if block.get('tradable') or primary_name is None:
+            ts_to_col[name] = 0
+            primary_name = name
+            col_idx = 1
+        else:
+            ts_to_col[name] = col_idx
+            col_idx += 1
+
+    for name, block in resolved.items():
+        if isinstance(block, dict) and block.get('type') == 'timeseries':
+            if name not in ts_to_col:
+                ts_to_col[name] = col_idx
+                col_idx += 1
+
+    node_buffers: Dict[str, CircularBuffer] = {}
+    buffer_sizes = dag.metadata.node_buffer_sizes if dag.metadata else {}
+
+    for name, block in resolved.items():
+        if isinstance(block, dict) and block.get('type') == 'timeseries':
+            buf_size = buffer_sizes.get(name, 20)
+            node_buffers[name] = CircularBuffer(buf_size)
+
+    node_functions: Dict[str, Any] = {}
+    for name, block in resolved.items():
+        if isinstance(block, dict) and block.get('type') == 'timeseries':
+            if block.get('function'):
+                node_functions[name] = {
+                    'func': block.get('_function'),
+                    'params': block.get('params', {}),
+                    'inputs': block.get('inputs', [])
+                }
+
+    def compute_node_output(node_name: str) -> Optional[float]:
+        if node_name not in node_functions:
+            return None
+
+        fn_info = node_functions[node_name]
+        func = fn_info['func']
+        params = fn_info['params']
+        inputs = fn_info['inputs']
+
+        if not inputs:
+            return None
+
+        input_arrays = []
+        for inp in inputs:
+            if inp in node_buffers:
+                arr = node_buffers[inp].to_array()
+                if arr is not None:
+                    input_arrays.append(arr)
+
+        if not input_arrays:
+            return None
+
+        try:
+            if len(input_arrays) == 1:
+                return func(input_arrays[0], **params)
+            else:
+                return func(*input_arrays, **params)
+        except Exception:
+            return None
+
+    def execute_dag_bar(bar_idx: int, bar_data: np.ndarray) -> Dict[str, float]:
+        for ts_name, col_idx in ts_to_col.items():
+            if col_idx < len(bar_data):
+                node_buffers[ts_name].push(float(bar_data[col_idx]))
+
+        execution_order = dag.metadata.execution_order if dag.metadata else resolved.keys()
+        node_outputs: Dict[str, float] = {}
+
+        for name in execution_order:
+            if name in ts_to_col:
+                node_outputs[name] = float(bar_data[ts_to_col[name]]) if ts_to_col[name] < len(bar_data) else 0.0
+            elif name in node_functions:
+                output = compute_node_output(name)
+                if output is not None:
+                    node_outputs[name] = output
+                    buf_size = buffer_sizes.get(name, 20)
+                    if name not in node_buffers:
+                        node_buffers[name] = CircularBuffer(buf_size)
+                    node_buffers[name].push(output)
+
+        return node_outputs
+
     def execute_bar_fn(bar_idx, bar_data, portfolio=None):
         current_price = float(bar_data[-1]) if len(bar_data) > 0 else 100.0
         
@@ -483,9 +582,12 @@ def train(
             portfolio_state = portfolio.get_state(current_price)
             current_position = portfolio.position
         
-        observation = bar_data
+        observation_dict = execute_dag_bar(bar_idx, bar_data)
         
-        action, conviction = agent.observe(observation, portfolio_state, bar_idx)
+        feature_names = list(observation_dict.keys())
+        obs_array = np.array([observation_dict.get(k, 0.0) for k in feature_names], dtype=np.float64)
+        
+        action, conviction = agent.observe(obs_array, portfolio_state, bar_idx)
         
         quantity = sizer.calculate_size(
             action=action,
@@ -523,8 +625,9 @@ def train(
 def test(
     dsl_string: str,
     checkpoint_path: str,
-    data: np.ndarray,
-    context: Optional[Dict[str, Any]] = None
+    data: Optional[np.ndarray] = None,
+    context: Optional[Dict[str, Any]] = None,
+    dates: Optional[np.ndarray] = None
 ) -> TestResult:
     """
     Run walk-forward test on saved checkpoint.
@@ -534,6 +637,7 @@ def test(
         checkpoint_path: Path to saved model checkpoint
         data: Price/feature data array for test period
         context: Optional context with registered components
+        dates: Optional date array for test_start resolution
 
     Returns:
         TestResult with equity curve, trades, and metrics
@@ -545,15 +649,33 @@ def test(
     raw = parse(dsl_string)
     validated = validate(raw)
     resolved = resolve(validated, context)
+    dag = build_dag(resolved)
 
     backtest_config = resolved.get('_backtest', {})
     
-    # If no data provided, automatically load from adapters in DSL
     if data is None:
-        data = _load_data_from_adapters(resolved, backtest_config)
-        if data is None:
+        result = _load_data_from_adapters(resolved, backtest_config)
+        if result is None:
             raise ValueError("Could not automatically load data from adapters. Please provide data array.")
-    test_start = backtest_config.get('test_start', '2022-01-01')
+        data, dates_from_load = result
+        if dates is None:
+            dates = dates_from_load
+    
+    test_start_str = backtest_config.get('test_start')
+    if test_start_str and dates is not None:
+        try:
+            import pandas as pd
+            test_date = pd.Timestamp(test_start_str, tz='UTC')
+            mask = dates >= test_date
+            if mask.any():
+                test_start_idx = int(np.argmax(mask))
+            else:
+                test_start_idx = int(len(data) * 0.7)
+        except Exception:
+            test_start_idx = int(len(data) * 0.7)
+    else:
+        test_start_idx = int(len(data) * 0.7)
+    
     model_config = resolved.get('model', {})
     agent_config = resolved.get('agent', {})
 
@@ -592,6 +714,100 @@ def test(
         transaction_costs=transaction_costs
     )
 
+    test_source_timeseries = {}
+    for name, block in resolved.items():
+        if isinstance(block, dict) and block.get('type') == 'timeseries':
+            if not block.get('inputs'):
+                test_source_timeseries[name] = block
+
+    test_ts_to_col = {}
+    test_col_idx = 0
+    test_primary_name = None
+    for name, block in test_source_timeseries.items():
+        if block.get('tradable') or test_primary_name is None:
+            test_ts_to_col[name] = 0
+            test_primary_name = name
+            test_col_idx = 1
+        else:
+            test_ts_to_col[name] = test_col_idx
+            test_col_idx += 1
+
+    for name, block in resolved.items():
+        if isinstance(block, dict) and block.get('type') == 'timeseries':
+            if name not in test_ts_to_col:
+                test_ts_to_col[name] = test_col_idx
+                test_col_idx += 1
+
+    test_node_buffers: Dict[str, CircularBuffer] = {}
+    test_buffer_sizes = dag.metadata.node_buffer_sizes if dag.metadata else {}
+
+    for name, block in resolved.items():
+        if isinstance(block, dict) and block.get('type') == 'timeseries':
+            buf_size = test_buffer_sizes.get(name, 20)
+            test_node_buffers[name] = CircularBuffer(buf_size)
+
+    test_node_functions: Dict[str, Any] = {}
+    for name, block in resolved.items():
+        if isinstance(block, dict) and block.get('type') == 'timeseries':
+            if block.get('function'):
+                test_node_functions[name] = {
+                    'func': block.get('_function'),
+                    'params': block.get('params', {}),
+                    'inputs': block.get('inputs', [])
+                }
+
+    def test_compute_node_output(node_name: str) -> Optional[float]:
+        if node_name not in test_node_functions:
+            return None
+
+        fn_info = test_node_functions[node_name]
+        func = fn_info['func']
+        params = fn_info['params']
+        inputs = fn_info['inputs']
+
+        if not inputs:
+            return None
+
+        input_arrays = []
+        for inp in inputs:
+            if inp in test_node_buffers:
+                arr = test_node_buffers[inp].to_array()
+                if arr is not None:
+                    input_arrays.append(arr)
+
+        if not input_arrays:
+            return None
+
+        try:
+            if len(input_arrays) == 1:
+                return func(input_arrays[0], **params)
+            else:
+                return func(*input_arrays, **params)
+        except Exception:
+            return None
+
+    def execute_test_dag_bar(bar_idx: int, bar_data: np.ndarray) -> Dict[str, float]:
+        for ts_name, col_idx in test_ts_to_col.items():
+            if col_idx < len(bar_data):
+                test_node_buffers[ts_name].push(float(bar_data[col_idx]))
+
+        execution_order = dag.metadata.execution_order if dag.metadata else resolved.keys()
+        node_outputs: Dict[str, float] = {}
+
+        for name in execution_order:
+            if name in test_ts_to_col:
+                node_outputs[name] = float(bar_data[test_ts_to_col[name]]) if test_ts_to_col[name] < len(bar_data) else 0.0
+            elif name in test_node_functions:
+                output = test_compute_node_output(name)
+                if output is not None:
+                    node_outputs[name] = output
+                    buf_size = test_buffer_sizes.get(name, 20)
+                    if name not in test_node_buffers:
+                        test_node_buffers[name] = CircularBuffer(buf_size)
+                    test_node_buffers[name].push(output)
+
+        return node_outputs
+
     def execute_bar_fn(bar_idx, bar_data, portfolio=None):
         current_price = float(bar_data[-1]) if len(bar_data) > 0 else 100.0
         
@@ -610,9 +826,12 @@ def test(
             }
             current_position = engine.position
         
-        observation = bar_data
+        test_observation_dict = execute_test_dag_bar(bar_idx, bar_data)
         
-        action, conviction = agent.observe(observation, portfolio_state, bar_idx)
+        test_feature_names = list(test_observation_dict.keys())
+        test_obs_array = np.array([test_observation_dict.get(k, 0.0) for k in test_feature_names], dtype=np.float64)
+        
+        action, conviction = agent.observe(test_obs_array, portfolio_state, bar_idx)
         
         quantity = sizer.calculate_size(
             action=action,
@@ -631,8 +850,6 @@ def test(
             'portfolio_value': portfolio_state.get('portfolio_value', engine.portfolio_value),
             'position': current_position
         }
-
-    test_start_idx = int(len(data) * 0.7)
 
     result = engine.run(data[test_start_idx:], execute_bar_fn)
 
@@ -663,9 +880,20 @@ def run(
     Returns:
         RunResult with train, test, and bootstrap results
     """
+    raw = parse(dsl_string)
+    validated = validate(raw)
+    resolved = resolve(validated, context)
+    backtest_config = resolved.get('_backtest', {})
+    
+    dates = None
+    if data is None:
+        result = _load_data_from_adapters(resolved, backtest_config)
+        if result is None:
+            raise ValueError("Could not load data from adapters.")
+        data, dates = result
+    
     train_result = train(dsl_string, context, data, checkpoint_dir)
-
-    test_result = test(dsl_string, train_result.checkpoint_path, data, context)
+    test_result = test(dsl_string, train_result.checkpoint_path, data, context, dates)
 
     bootstrap_result = None
     backtest_config = test_result.config.get('_backtest', {})

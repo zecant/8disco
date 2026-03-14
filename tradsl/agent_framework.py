@@ -543,6 +543,7 @@ class ParameterizedAgent(BaseAgentArchitecture):
         self._bar_index = 0
         self._update_count = 0
         self._last_sharpe = 0.0
+        self._last_log_prob = 0.0
         
         algorithm_cls = RL_ALGORITHMS.get(algorithm, PPOUpdate)
         self._algorithm = algorithm_cls(**self.algorithm_params)
@@ -627,6 +628,8 @@ class ParameterizedAgent(BaseAgentArchitecture):
         
         action_idx = np.random.choice(self.n_actions, p=probs)
         
+        self._last_log_prob = float(np.log(probs[action_idx] + 1e-8))
+        
         conviction = float(probs[action_idx])
         
         return action_idx, conviction
@@ -665,7 +668,8 @@ class ParameterizedAgent(BaseAgentArchitecture):
             reward=reward,
             next_observation=next_observation.copy(),
             done=done,
-            priority=abs(reward) + 1.0
+            priority=abs(reward) + 1.0,
+            log_prob=self._last_log_prob
         )
         
         self.replay_buffer.add(experience)
