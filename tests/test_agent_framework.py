@@ -359,8 +359,10 @@ class TestPPOUpdate:
         update = PPOUpdate(gamma=0.99, lam=0.95)
         
         rewards = np.array([0.1, -0.1, 0.2, -0.05, 0.15])
+        values = np.array([1.0, 0.9, 0.8, 0.85, 0.9, 0.0])
+        dones = np.array([False, False, False, False, False])
         
-        advantages = update._compute_advantages(rewards)
+        advantages = update._compute_advantages(rewards, values, dones)
         
         assert len(advantages) == len(rewards)
 

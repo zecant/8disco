@@ -3,6 +3,7 @@ import pytest
 import numpy as np
 from tradsl.functions import (
     log_returns, sma, ema, rsi, rolling_std, volatility, roc, zscore,
+    spread, ratio, rolling_correlation, beta,
     FUNCTION_REGISTRY, get_function, compute_function, FeatureCategory
 )
 
@@ -168,3 +169,81 @@ class TestFunctionRegistry:
         expected = ['log_returns', 'sma', 'ema', 'rsi', 'rolling_std', 'volatility', 'roc', 'zscore']
         for name in expected:
             assert name in FUNCTION_REGISTRY
+
+
+class TestSpread:
+    def test_basic_spread(self):
+        arr1 = np.array([100.0, 105.0, 110.0])
+        arr2 = np.array([50.0, 52.0, 55.0])
+        result = spread(arr1, arr2)
+        assert result == 55.0
+    
+    def test_negative_spread(self):
+        arr1 = np.array([100.0])
+        arr2 = np.array([150.0])
+        result = spread(arr1, arr2)
+        assert result == -50.0
+    
+    def test_nan_handling(self):
+        arr1 = np.array([100.0, np.nan])
+        arr2 = np.array([50.0, 52.0])
+        result = spread(arr1, arr2)
+        assert result is None
+
+
+class TestRatio:
+    def test_basic_ratio(self):
+        arr1 = np.array([100.0, 110.0])
+        arr2 = np.array([50.0, 55.0])
+        result = ratio(arr1, arr2)
+        assert result == 2.0
+    
+    def test_zero_division(self):
+        arr1 = np.array([100.0])
+        arr2 = np.array([0.0])
+        result = ratio(arr1, arr2)
+        assert result is None
+
+
+class TestRollingCorrelation:
+    def test_perfect_positive_correlation(self):
+        arr1 = np.array([1.0, 2.0, 3.0, 4.0, 5.0] * 4)
+        arr2 = np.array([1.0, 2.0, 3.0, 4.0, 5.0] * 4)
+        result = rolling_correlation(arr1, arr2, period=20)
+        assert result is not None
+        assert abs(result - 1.0) < 0.01
+    
+    def test_perfect_negative_correlation(self):
+        arr1 = np.array([5.0, 4.0, 3.0, 2.0, 1.0] * 4)
+        arr2 = np.array([1.0, 2.0, 3.0, 4.0, 5.0] * 4)
+        result = rolling_correlation(arr1, arr2, period=20)
+        assert result is not None
+        assert abs(result + 1.0) < 0.01
+    
+    def test_insufficient_data(self):
+        arr1 = np.array([1.0, 2.0, 3.0])
+        arr2 = np.array([1.0, 2.0, 3.0])
+        result = rolling_correlation(arr1, arr2, period=20)
+        assert result is None
+
+
+class TestBeta:
+    def test_beta_one(self):
+        arr = np.array([1.0, 2.0, 3.0, 4.0, 5.0] * 12)
+        benchmark = np.array([1.0, 2.0, 3.0, 4.0, 5.0] * 12)
+        result = beta(arr, benchmark, period=60)
+        assert result is not None
+        assert abs(result - 1.0) < 0.01
+    
+    def test_beta_zero(self):
+        arr = np.array([1.0] * 60)
+        benchmark = np.array([1.0, 2.0, 3.0, 4.0, 5.0] * 12)
+        result = beta(arr, benchmark, period=60)
+        assert result is not None
+        assert abs(result) < 0.01
+    
+    def test_insufficient_data(self):
+        arr = np.array([1.0, 2.0, 3.0])
+        benchmark = np.array([1.0, 2.0, 3.0])
+        result = beta(arr, benchmark, period=60)
+        assert result is None

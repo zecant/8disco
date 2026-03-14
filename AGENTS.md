@@ -22,45 +22,27 @@ python -m pytest -k "test_init"
 # Run with verbose output
 python -m pytest tests/ -v
 
-# Run with coverage (if installed)
+# Run with coverage
 python -m pytest tests/ --cov=tradsl --cov-report=term-missing
 
-# Run integration tests only
+# Run/skip integration tests
 python -m pytest -m integration
-
-# Skip integration tests
 python -m pytest -m "not integration"
+
+# Skip slow tests
+python -m pytest -m "not slow"
 ```
 
 ### Installation
 
 ```bash
-# Install in development mode
-pip install -e .
-
-# Install with all dependencies
-pip install -e ".[dev]"
-```
-
-### Type Checking (Optional)
-
-```bash
-# If mypy is configured
-python -m mypy tradsl/
+pip install -e .          # Install in development mode
+pip install -e ".[dev]"   # Install with all dependencies
 ```
 
 ## Code Style Guidelines
 
-### General Principles
-
-- Write clean, readable code with clear intent
-- Keep functions focused on a single responsibility
-- Use descriptive names for variables, functions, and classes
-- Add docstrings to public APIs
-
-### Imports
-
-Order imports as follows (per PEP 8):
+### Imports (PEP 8)
 
 ```python
 # Standard library
@@ -119,9 +101,6 @@ def process_data(
 Use dataclasses for simple data containers:
 
 ```python
-from dataclasses import dataclass
-from typing import Optional
-
 @dataclass
 class TrainResult:
     """Result of training pass."""
@@ -135,7 +114,7 @@ class TrainResult:
 
 - Use custom exceptions from `tradsl.exceptions`
 - Raise specific exceptions with clear messages
-- Handle exceptions at appropriate boundaries
+- Chain exceptions with `from e`
 
 ```python
 from tradsl.exceptions import AdapterError, ModelError
@@ -152,31 +131,7 @@ def load_data(self, symbol: str) -> pd.DataFrame:
 
 ### Docstrings
 
-Use Google-style docstrings:
-
-```python
-def function_name(param1: str, param2: int) -> bool:
-    """Short description of what the function does.
-
-    Longer description if needed, explaining the behavior,
-    side effects, or important implementation details.
-
-    Args:
-        param1: Description of first parameter
-        param2: Description of second parameter
-
-    Returns:
-        Description of return value
-
-    Raises:
-        ValueError: When param2 is negative
-
-    Example:
-        >>> result = function_name("test", 5)
-        >>> print(result)
-        True
-    """
-```
+Use Google-style docstrings for all public APIs.
 
 ## Testing Conventions
 
@@ -206,27 +161,25 @@ class TestRandomForestModel:
         assert isinstance(result, float)
 ```
 
-### Test Naming
+### Test Fixtures
 
-- Test method names should describe the behavior being tested
-- Format: `test_<what_is_being_tested>`
-
-### Fixtures
-
-Use conftest.py fixtures for shared setup:
+The test suite uses an autouse fixture that cleans the model registry:
 
 ```python
 # tests/conftest.py
-import pytest
-from tradsl import clear_registry
-
 @pytest.fixture(autouse=True)
 def clean_registry():
     """Clean registry before each test."""
+    from tradsl import clear_registry
     clear_registry()
     yield
     clear_registry()
 ```
+
+### Test Markers
+
+- `@pytest.mark.integration` - Tests requiring external dependencies
+- `@pytest.mark.slow` - Tests that take significant time to run
 
 ## Project Structure
 
@@ -236,13 +189,13 @@ tradsl/
 ├── models.py            # Abstract base classes
 ├── models_impl.py       # Model implementations
 ├── agent_framework.py   # RL agent framework
-├── adapters.py         # Data adapters
-├── yf_adapter.py       # Yahoo Finance adapter
-├── training.py         # Training utilities
-├── backtest.py         # Backtesting engine
-├── exceptions.py       # Custom exceptions
-├── schema.py           # Validation schema
-├── parser.py           # DSL parser
+├── adapters.py          # Data adapters
+├── yf_adapter.py        # Yahoo Finance adapter
+├── training.py          # Training utilities
+├── backtest.py          # Backtesting engine
+├── exceptions.py        # Custom exceptions
+├── schema.py            # Validation schema
+├── parser.py            # DSL parser
 └── ...
 ```
 

@@ -65,7 +65,7 @@ def build_dag(config: Dict[str, Any]) -> DAG:
 
     _check_cycles(nodes, edges)
 
-    execution_order = _topological_sort(nodes, edges)
+    execution_order = _topological_sort(nodes, reverse_edges)
 
     source_nodes = {
         name for name, block in nodes.items()
@@ -139,17 +139,17 @@ def _check_cycles(nodes: Dict[str, Dict], edges: Dict[str, List[str]]) -> None:
                 raise
 
 
-def _topological_sort(nodes: Dict[str, Dict], edges: Dict[str, List[str]]) -> List[str]:
+def _topological_sort(nodes: Dict[str, Dict], reverse_edges: Dict[str, List[str]]) -> List[str]:
     """
     Topological sort using Kahn's algorithm with deque.
 
     Stable sort: nodes with same in-degree are processed alphabetically.
+    
+    Args:
+        nodes: Dict of node name -> node config
+        reverse_edges: Dict mapping node -> its dependencies (nodes it depends on)
     """
-    in_degree = {name: 0 for name in nodes}
-    for name in nodes:
-        for dep in edges.get(name, []):
-            if dep in in_degree:
-                in_degree[dep] += 1
+    in_degree = {name: len(reverse_edges.get(name, [])) for name in nodes}
 
     queue = deque([name for name, deg in in_degree.items() if deg == 0])
     queue = deque(sorted(queue))
@@ -157,15 +157,16 @@ def _topological_sort(nodes: Dict[str, Dict], edges: Dict[str, List[str]]) -> Li
     result = []
 
     while queue:
-        queue = deque(sorted(queue))
         node = queue.popleft()
         result.append(node)
 
-        for dependent in edges.get(node, []):
-            if dependent in in_degree:
+        for dependent in nodes:
+            if node in reverse_edges.get(dependent, []):
                 in_degree[dependent] -= 1
                 if in_degree[dependent] == 0:
                     queue.append(dependent)
+        if queue:
+            queue = deque(sorted(queue))
 
     if len(result) != len(nodes):
         remaining = [n for n in nodes if n not in result]

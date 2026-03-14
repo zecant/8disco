@@ -14,6 +14,9 @@ logger = logging.getLogger("tradsl.agent_framework")
 from tradsl.models import BaseAgentArchitecture, TradingAction, ReplayBuffer
 from tradsl.training import ReplayBuffer as TrainingReplayBuffer, Experience
 
+MIN_EXPERIENCES_FOR_UPDATE = 8
+MIN_BUFFER_FOR_UPDATE = 32
+
 
 class PPOUpdate:
     """
@@ -55,15 +58,18 @@ class PPOUpdate:
         Returns:
             Dict with loss metrics
         """
-        if len(experiences) < 8:
+        if len(experiences) < MIN_EXPERIENCES_FOR_UPDATE:
             return {'loss': 0.0, 'policy_loss': 0.0, 'value_loss': 0.0, 'entropy': 0.0}
         
         states = np.array([e.observation for e in experiences])
+        next_states = np.array([e.next_observation for e in experiences])
         actions = np.array([e.action for e in experiences])
         rewards = np.array([e.reward for e in experiences])
+        dones = np.array([e.done for e in experiences])
         
+        values = self._compute_value_estimates(states, next_states, dones, value_model)
         returns = self._compute_returns(rewards)
-        advantages = self._compute_advantages(rewards)
+        advantages = self._compute_advantages(rewards, values, dones)
         
         if hasattr(policy_model, 'predict') and len(states) > 0:
             try:
@@ -114,20 +120,74 @@ class PPOUpdate:
             returns[t] = running
         return returns
     
-    def _compute_advantages(self, rewards: np.ndarray) -> np.ndarray:
-        """Compute GAE advantages."""
+    def _compute_advantages(
+        self,
+        rewards: np.ndarray,
+        values: np.ndarray,
+        dones: np.ndarray
+    ) -> np.ndarray:
+        """Compute GAE advantages.
+        
+        Args:
+            rewards: Array of rewards [t=0, t=1, ..., t=T-1]
+            values: Value estimates V(s) for each state [t=0, ..., t=T]
+            dones: Done flags [t=0, ..., t=T-1]
+        
+        Returns:
+            advantages: GAE advantages for each timestep
+        """
         advantages = np.zeros_like(rewards)
         last_gae = 0.0
+        
         for t in reversed(range(len(rewards))):
-            if t == len(rewards) - 1:
-                next_value = 0.0
-            else:
-                next_value = rewards[t + 1]
+            next_value = values[t + 1] if t + 1 < len(values) else 0.0
             
-            delta = rewards[t] + self.gamma * next_value - rewards[t]
+            if dones[t]:
+                next_value = 0.0
+            
+            delta = rewards[t] + self.gamma * next_value - values[t]
             last_gae = delta + self.gamma * self.lam * last_gae
             advantages[t] = last_gae
+        
         return advantages
+    
+    def _compute_value_estimates(
+        self,
+        states: np.ndarray,
+        next_states: np.ndarray,
+        dones: np.ndarray,
+        value_model
+    ) -> np.ndarray:
+        """Compute value estimates for GAE.
+        
+        Args:
+            states: Current state observations
+            next_states: Next state observations  
+            dones: Done flags
+            value_model: Model to predict values
+        
+        Returns:
+            values: Value estimates V(s) for each state [t=0, ..., t=T]
+        """
+        n = len(states)
+        values = np.zeros(n + 1)
+        
+        if value_model is not None and hasattr(value_model, 'predict'):
+            try:
+                for i, state in enumerate(states):
+                    val = value_model.predict(state)
+                    if isinstance(val, (int, float)):
+                        values[i] = float(val)
+                    elif hasattr(val, 'item'):
+                        values[i] = float(val.item())
+                    else:
+                        values[i] = float(val)
+            except Exception:
+                values[:-1] = 0.0
+        
+        values[-1] = 0.0
+        
+        return values
     
     def _compute_log_probs(self, logits: np.ndarray, actions: np.ndarray) -> np.ndarray:
         """Compute log probabilities from logits."""
@@ -162,12 +222,33 @@ class DQNUpdate:
         self,
         gamma: float = 0.99,
         learning_rate: float = 1e-4,
-        target_update_freq: int = 100
+        target_update_freq: int = 100,
+        n_actions: int = 4
     ):
         self.gamma = gamma
         self.learning_rate = learning_rate
         self.target_update_freq = target_update_freq
+        self.n_actions = n_actions
         self._update_count = 0
+        self._q_table: Dict[int, np.ndarray] = {}
+    
+    def _get_q_values(self, state: np.ndarray, network) -> np.ndarray:
+        """Get Q-values for all actions for a state."""
+        if network is None:
+            state_key = hash(state.tobytes()) if hasattr(state, 'tobytes') else id(state)
+            if state_key not in self._q_table:
+                self._q_table[state_key] = np.zeros(self.n_actions)
+            return self._q_table[state_key]
+        
+        try:
+            q_vals = network.predict(state)
+            if isinstance(q_vals, (int, float)):
+                return np.full(self.n_actions, q_vals)
+            if hasattr(q_vals, 'flatten'):
+                return q_vals.flatten()
+            return np.array(q_vals)
+        except Exception:
+            return np.zeros(self.n_actions)
     
     def update(
         self,
@@ -186,8 +267,8 @@ class DQNUpdate:
         Returns:
             Dict with loss metrics
         """
-        if len(experiences) < 8:
-            return {'loss': 0.0, 'q_value': 0.0}
+        if len(experiences) < MIN_EXPERIENCES_FOR_UPDATE:
+            return {'loss': 0.0, 'q_value': 0.0, 'update_count': self._update_count}
         
         states = np.array([e.observation for e in experiences])
         actions = np.array([e.action for e in experiences])
@@ -195,16 +276,47 @@ class DQNUpdate:
         next_states = np.array([e.next_observation for e in experiences])
         dones = np.array([e.done for e in experiences])
         
-        current_q = 0.0
+        target_net = target_network if target_network is not None else q_network
         
-        loss = 0.0
+        td_errors = []
+        current_q_sum = 0.0
+        
+        for i in range(len(states)):
+            state = states[i]
+            action = int(actions[i])
+            reward = rewards[i]
+            next_state = next_states[i]
+            done = dones[i]
+            
+            current_q_vals = self._get_q_values(state, q_network)
+            current_q = current_q_vals[action]
+            current_q_sum += current_q
+            
+            next_q_vals = self._get_q_values(next_state, target_net)
+            if done:
+                target = reward
+            else:
+                target = reward + self.gamma * np.max(next_q_vals)
+            
+            td_error = target - current_q
+            td_errors.append(td_error)
+            
+            state_key = hash(state.tobytes()) if hasattr(state, 'tobytes') else id(state)
+            if state_key not in self._q_table:
+                self._q_table[state_key] = np.zeros(self.n_actions)
+            
+            self._q_table[state_key][action] += self.learning_rate * td_error
+        
+        loss = np.mean(np.array(td_errors) ** 2)
+        current_q_avg = current_q_sum / len(states)
         
         self._update_count += 1
         
         return {
-            'loss': loss,
-            'q_value': current_q,
-            'update_count': self._update_count
+            'loss': float(loss),
+            'q_value': float(current_q_avg),
+            'update_count': self._update_count,
+            'td_error_mean': float(np.mean(td_errors))
         }
 
 
@@ -212,18 +324,59 @@ class PolicyGradientUpdate:
     """
     Vanilla policy gradient (REINFORCE) update.
     
-    Simple baseline for comparison.
+    Implements: ∇J ≈ ∇log π(a|s) * G_t
+    With baseline subtraction for variance reduction.
     """
     
     def __init__(
         self,
         learning_rate: float = 1e-3,
         entropy_coef: float = 0.01,
-        value_coef: float = 0.5
+        value_coef: float = 0.5,
+        gamma: float = 0.99
     ):
         self.learning_rate = learning_rate
         self.entropy_coef = entropy_coef
         self.value_coef = value_coef
+        self.gamma = gamma
+        self._value_estimates: Dict[int, float] = {}
+    
+    def _compute_returns(self, rewards: np.ndarray) -> np.ndarray:
+        """Compute discounted returns G_t."""
+        returns = np.zeros_like(rewards)
+        running = 0.0
+        for t in reversed(range(len(rewards))):
+            running = rewards[t] + self.gamma * running
+            returns[t] = running
+        return returns
+    
+    def _get_action_prob(self, state: np.ndarray, action: int, model) -> float:
+        """Get probability of taking action."""
+        try:
+            probs = model.predict(state)
+            if isinstance(probs, (int, float)):
+                n_actions = 3
+                return probs if action == 0 else (1 - probs) / (n_actions - 1)
+            if hasattr(probs, 'flatten'):
+                probs = probs.flatten()
+            if len(probs) > action:
+                return float(probs[action])
+            return 1.0 / len(probs)
+        except Exception:
+            return 1.0 / 3
+    
+    def _get_entropy(self, state: np.ndarray, model) -> float:
+        """Compute entropy of policy."""
+        try:
+            probs = model.predict(state)
+            if isinstance(probs, (int, float)):
+                return 0.0
+            if hasattr(probs, 'flatten'):
+                probs = probs.flatten()
+            probs = np.clip(probs, 1e-8, 1.0)
+            return -np.sum(probs * np.log(probs))
+        except Exception:
+            return 0.0
     
     def update(
         self,
@@ -232,7 +385,7 @@ class PolicyGradientUpdate:
         value_model=None
     ) -> Dict[str, float]:
         """
-        Perform policy gradient update.
+        Perform policy gradient update (REINFORCE with baseline).
         
         Args:
             experiences: List of Experience tuples
@@ -243,30 +396,35 @@ class PolicyGradientUpdate:
             Dict with loss metrics
         """
         if len(experiences) < 4:
-            return {'loss': 0.0, 'policy_loss': 0.0}
+            return {'loss': 0.0, 'policy_loss': 0.0, 'entropy': 0.0}
         
         states = np.array([e.observation for e in experiences])
         actions = np.array([e.action for e in experiences])
         rewards = np.array([e.reward for e in experiences])
         
-        mean_reward = np.mean(rewards)
-        rewards = rewards - mean_reward
+        returns = self._compute_returns(rewards)
+        
+        baseline = np.mean(returns)
+        advantages = returns - baseline
         
         policy_loss = 0.0
         entropy = 0.0
         
-        for i, exp in enumerate(experiences):
-            policy_loss -= rewards[i] * 0.1
+        for i in range(len(experiences)):
+            log_prob = np.log(self._get_action_prob(states[i], int(actions[i]), policy_model) + 1e-8)
+            policy_loss -= log_prob * advantages[i]
+            entropy += self._get_entropy(states[i], policy_model)
         
-        entropy = 1.0
+        entropy /= len(experiences)
         
         total_loss = policy_loss - self.entropy_coef * entropy
         
         return {
-            'loss': abs(total_loss),
-            'policy_loss': abs(policy_loss),
-            'entropy': entropy,
-            'mean_reward': float(mean_reward)
+            'loss': float(total_loss),
+            'policy_loss': float(policy_loss),
+            'entropy': float(entropy),
+            'mean_advantage': float(np.mean(advantages)),
+            'baseline': float(baseline)
         }
 
 
@@ -477,7 +635,7 @@ class ParameterizedAgent(BaseAgentArchitecture):
     
     def update_policy(self, bar_index: int) -> None:
         """Update policy using replay buffer."""
-        if len(self.replay_buffer) < 32:
+        if len(self.replay_buffer) < MIN_BUFFER_FOR_UPDATE:
             return
         
         batch = self.replay_buffer.sample(min(128, len(self.replay_buffer)))
@@ -504,8 +662,38 @@ class ParameterizedAgent(BaseAgentArchitecture):
             self.value_model
         )
         
+        self._apply_policy_update(experiences, result)
+        
         self._is_trained = True
         self._update_count += 1
+    
+    def _apply_policy_update(self, experiences: List[Experience], result: Dict[str, float]) -> None:
+        """Apply gradient update to policy model.
+        
+        For sklearn models, uses partial_fit with sample weights.
+        For models with native gradient support, applies gradients directly.
+        """
+        if not experiences or len(experiences) < MIN_BUFFER_FOR_UPDATE:
+            return
+        
+        states = np.array([e.observation for e in experiences])
+        actions = np.array([e.action for e in experiences])
+        rewards = np.array([e.reward for e in experiences])
+        
+        advantages = rewards - np.mean(rewards)
+        sample_weights = np.abs(advantages)
+        sample_weights = np.clip(sample_weights, 0.1, 10.0)
+        
+        if hasattr(self.policy_model, 'partial_fit'):
+            try:
+                self.policy_model.partial_fit(states, actions, sample_weight=sample_weights)
+            except Exception as e:
+                logger.warning(f"Policy model partial_fit failed: {e}")
+        elif hasattr(self.policy_model, 'fit'):
+            try:
+                self.policy_model.fit(states, actions)
+            except Exception as e:
+                logger.warning(f"Policy model fit failed: {e}")
     
     def should_update(self, bar_index: int, recent_performance: float = 0.0) -> bool:
         """

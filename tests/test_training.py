@@ -293,8 +293,8 @@ class TestBlockTrainer:
         
         data = np.random.randn(400, 5)
         
-        def execute_bar_fn(bar_idx, bar_data):
-            return {'portfolio_value': 100000.0, 'rolling_sharpe': 0.0}
+        def execute_bar_fn(bar_idx, bar_data, portfolio=None):
+            return {'portfolio_value': 100000.0, 'rolling_sharpe': 0.0, 'action': None, 'quantity': 0, 'price': 100.0}
         
         result = trainer.train(data, 20, execute_bar_fn)
         

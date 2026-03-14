@@ -238,6 +238,116 @@ def zscore(arr: np.ndarray, period: int = 20, **params) -> Optional[float]:
     return float((current - mean) / std)
 
 
+def spread(arr1: np.ndarray, arr2: np.ndarray, **params) -> Optional[float]:
+    """
+    Compute spread: arr1 - arr2 (current values).
+    
+    Args:
+        arr1: First series (current value used)
+        arr2: Second series (current value used)
+    
+    Returns:
+        Spread value (arr1 - arr2)
+    """
+    if arr1 is None or arr2 is None:
+        return None
+    if len(arr1) < 1 or len(arr2) < 1:
+        return None
+    v1 = arr1[-1]
+    v2 = arr2[-1]
+    if np.isnan(v1) or np.isnan(v2):
+        return None
+    return float(v1 - v2)
+
+
+def ratio(arr1: np.ndarray, arr2: np.ndarray, **params) -> Optional[float]:
+    """
+    Compute ratio: arr1 / arr2 (current values).
+    
+    Args:
+        arr1: First series (numerator)
+        arr2: Second series (denominator)
+    
+    Returns:
+        Ratio value (arr1 / arr2)
+    """
+    if arr1 is None or arr2 is None:
+        return None
+    if len(arr1) < 1 or len(arr2) < 1:
+        return None
+    v1 = arr1[-1]
+    v2 = arr2[-1]
+    if np.isnan(v1) or np.isnan(v2) or v2 == 0:
+        return None
+    return float(v1 / v2)
+
+
+def rolling_correlation(arr1: np.ndarray, arr2: np.ndarray, period: int = 20, **params) -> Optional[float]:
+    """
+    Compute rolling Pearson correlation between two series.
+    
+    Args:
+        arr1: First series (full array)
+        arr2: Second series (full array)
+        period: Rolling window size
+    
+    Returns:
+        Correlation coefficient in [-1, 1]
+    """
+    if arr1 is None or arr2 is None:
+        return None
+    if len(arr1) < period or len(arr2) < period:
+        return None
+    
+    a1 = arr1[-period:]
+    a2 = arr2[-period:]
+    
+    if np.any(np.isnan(a1)) or np.any(np.isnan(a2)):
+        return None
+    
+    cov = np.cov(a1, a2, ddof=0)[0, 1]
+    std1 = np.std(a1, ddof=0)
+    std2 = np.std(a2, ddof=0)
+    
+    if std1 == 0 or std2 == 0:
+        return None
+    
+    return float(cov / (std1 * std2))
+
+
+def beta(asset_arr: np.ndarray, benchmark_arr: np.ndarray, period: int = 60, **params) -> Optional[float]:
+    """
+    Compute rolling beta: covariance(asset, benchmark) / variance(benchmark).
+    
+    Args:
+        asset_arr: Asset returns/volatility series (full array)
+        benchmark_arr: Benchmark returns/volatility series (full array)
+        period: Rolling window size
+    
+    Returns:
+        Beta coefficient
+    """
+    if asset_arr is None or benchmark_arr is None:
+        return None
+    if len(asset_arr) < period or len(benchmark_arr) < period:
+        return None
+    
+    a = asset_arr[-period:]
+    b = benchmark_arr[-period:]
+    
+    if np.any(np.isnan(a)) or np.any(np.isnan(b)):
+        return None
+    
+    var_b = np.var(b, ddof=0)
+    
+    if var_b == 0:
+        return None
+    
+    cov = np.cov(a, b, ddof=0)[0, 1]
+    
+    return float(cov / var_b)
+
+
 # Registry of all implemented functions
 FUNCTION_REGISTRY: Dict[str, FunctionSpec] = {
     'log_returns': FunctionSpec(
@@ -287,6 +397,30 @@ FUNCTION_REGISTRY: Dict[str, FunctionSpec] = {
         category=FeatureCategory.SAFE,
         description="Rolling z-score",
         min_lookback=2
+    ),
+    'spread': FunctionSpec(
+        func=spread,
+        category=FeatureCategory.SAFE,
+        description="Spread between two series: arr1 - arr2",
+        min_lookback=1
+    ),
+    'ratio': FunctionSpec(
+        func=ratio,
+        category=FeatureCategory.SAFE,
+        description="Ratio of two series: arr1 / arr2",
+        min_lookback=1
+    ),
+    'rolling_correlation': FunctionSpec(
+        func=rolling_correlation,
+        category=FeatureCategory.SAFE,
+        description="Rolling Pearson correlation between two series",
+        min_lookback=20
+    ),
+    'beta': FunctionSpec(
+        func=beta,
+        category=FeatureCategory.SAFE,
+        description="Rolling beta: covariance(asset, benchmark) / variance(benchmark)",
+        min_lookback=60
     ),
 }
 

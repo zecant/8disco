@@ -159,7 +159,7 @@ class BacktestEngine:
     def run(
         self,
         data: np.ndarray,
-        execute_bar_fn: Callable[[int, np.ndarray], Dict[str, float]]
+        execute_bar_fn: Callable[[int, np.ndarray], Dict[str, Any]]
     ) -> BacktestResult:
         """
         Run backtest.
@@ -167,22 +167,62 @@ class BacktestEngine:
         Args:
             data: Price/feature data
             execute_bar_fn: Function to execute strategy logic
+                            Must return portfolio_state dict with:
+                            - action: TradingAction (BUY, SELL, HOLD, FLATTEN)
+                            - quantity: float
+                            - price: float (current price)
+                            - symbol: str
+                            - portfolio_value: float
         
         Returns:
             BacktestResult with equity curve, trades, metrics
         """
+        from tradsl.models import TradingAction
+        
         self._reset()
         
         for bar_idx in range(len(data)):
             portfolio_state = execute_bar_fn(bar_idx, data[bar_idx])
+            
+            action = portfolio_state.get('action', TradingAction.HOLD)
+            current_price = portfolio_state.get('price', data[bar_idx][-1] if len(data[bar_idx]) > 0 else 100.0)
+            symbol = portfolio_state.get('symbol', 'UNKNOWN')
+            quantity = portfolio_state.get('quantity', 0.0)
+            
+            if action == TradingAction.BUY and quantity > 0:
+                self.execute_trade(
+                    symbol=symbol,
+                    side="buy",
+                    quantity=quantity,
+                    price=current_price,
+                    timestamp=bar_idx
+                )
+            elif action == TradingAction.SELL and quantity > 0:
+                self.execute_trade(
+                    symbol=symbol,
+                    side="sell",
+                    quantity=quantity,
+                    price=current_price,
+                    timestamp=bar_idx
+                )
+            elif action == TradingAction.FLATTEN:
+                if self.position != 0:
+                    self.execute_trade(
+                        symbol=symbol,
+                        side="sell" if self.position > 0 else "buy",
+                        quantity=abs(self.position),
+                        price=current_price,
+                        timestamp=bar_idx
+                    )
             
             self.equity_curve.append(self.portfolio_value)
             
             if self.portfolio_value > self.high_water_mark:
                 self.high_water_mark = self.portfolio_value
             
-            current_dd = (self.high_water_mark - self.portfolio_value) / self.high_water_mark
-            self.drawdown = max(self.drawdown, current_dd)
+            if self.high_water_mark > 0:
+                current_dd = (self.high_water_mark - self.portfolio_value) / self.high_water_mark
+                self.drawdown = max(self.drawdown, current_dd)
         
         metrics = compute_metrics(
             np.array(self.equity_curve),

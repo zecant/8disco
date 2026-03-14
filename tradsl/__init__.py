@@ -248,23 +248,104 @@ def train(
     from tradsl.rewards import AsymmetricHighWaterMarkReward
     from tradsl.sizers import KellySizer
 
-    policy = RandomForestModel(n_estimators=10, random_state=42)
+    model_config = resolved.get('model', {})
+    agent_config = resolved.get('agent', {})
+    backtest_config = resolved.get('_backtest', {})
+
+    n_estimators = model_config.get('params', {}).get('n_estimators', 10) if model_config.get('params') else 10
+    replay_buffer_size = model_config.get('replay_buffer_size', 4096)
+    
+    policy = RandomForestModel(n_estimators=n_estimators, random_state=training_config.seed)
     agent = ParameterizedAgent(
         policy_model=policy,
         update_schedule=training_config.retrain_schedule,
         update_n=training_config.retrain_n,
-        replay_buffer_size=4096,
+        replay_buffer_size=replay_buffer_size,
         seed=training_config.seed
     )
 
-    reward_fn = AsymmetricHighWaterMarkReward()
-    sizer = KellySizer()
+    reward_name = model_config.get('reward_function', 'asymmetric_high_water_mark')
+    reward_fn_class = _registry.get('rewards', {}).get(reward_name)
+    if reward_fn_class is None:
+        reward_fn_class = AsymmetricHighWaterMarkReward
+    reward_fn = reward_fn_class()
+
+    sizer_name = agent_config.get('sizer', 'kelly')
+    sizer_class = _registry.get('sizers', {}).get(sizer_name)
+    if sizer_class is None:
+        sizer_class = KellySizer
+    sizer = sizer_class()
+
+    trainable_models = {}
+    for name, block in resolved.items():
+        if isinstance(block, dict) and block.get('type') == 'trainable_model':
+            model_class = _registry.get('trainable_models', {}).get(block.get('class'))
+            if model_class:
+                model_params = block.get('params', {})
+                model = model_class(**model_params)
+                trainable_models[name] = {
+                    'model': model,
+                    'label_function': block.get('label_function'),
+                    'retrain_schedule': block.get('retrain_schedule', 'every_n_bars'),
+                    'training_window': block.get('training_window', 504)
+                }
+
+    label_functions = _registry.get('label_functions', {})
 
     block_sampler = BlockSampler(training_config)
-    trainer = BlockTrainer(training_config, agent, reward_fn, block_sampler)
+    
+    symbol = list(agent_config.get('tradable', ['UNKNOWN']))[0] if agent_config.get('tradable') else 'UNKNOWN'
+    
+    trainer = BlockTrainer(
+        training_config, agent, reward_fn, block_sampler,
+        trainable_models=trainable_models,
+        label_functions=label_functions,
+        capital=backtest_config.get('capital', 100000.0),
+        sizer=sizer,
+        symbol=symbol
+    )
 
-    def execute_bar_fn(bar_idx, bar_data):
-        return {'portfolio_value': 100000.0, 'position': 0.0}
+    capital = backtest_config.get('capital', 100000.0)
+
+    def execute_bar_fn(bar_idx, bar_data, portfolio=None):
+        current_price = float(bar_data[-1]) if len(bar_data) > 0 else 100.0
+        
+        if portfolio is None:
+            portfolio_state = {
+                'portfolio_value': capital,
+                'position': 0.0,
+                'unrealized_pnl': 0.0,
+                'realized_pnl': 0.0,
+                'drawdown': 0.0,
+                'high_water_mark': capital,
+                'bars_in_trade': 0
+            }
+            current_position = 0.0
+        else:
+            portfolio_state = portfolio.get_state()
+            current_position = portfolio.position
+        
+        observation = bar_data
+        
+        action, conviction = agent.observe(observation, portfolio_state, bar_idx)
+        
+        quantity = sizer.calculate_size(
+            action=action,
+            conviction=conviction,
+            current_position=current_position,
+            portfolio_value=portfolio_state.get('portfolio_value', capital),
+            instrument_id=symbol,
+            current_price=current_price
+        )
+        
+        return {
+            'action': action,
+            'quantity': quantity,
+            'price': current_price,
+            'symbol': symbol,
+            'portfolio_value': portfolio_state.get('portfolio_value', capital),
+            'position': current_position
+        }
 
     warmup_bars = dag.metadata.warmup_bars if dag.metadata else 20
 
@@ -309,29 +390,78 @@ def test(
 
     backtest_config = resolved.get('_backtest', {})
     test_start = backtest_config.get('test_start', '2022-01-01')
+    model_config = resolved.get('model', {})
+    agent_config = resolved.get('agent', {})
 
     from tradsl.models_impl import RandomForestModel
     from tradsl.agent_framework import ParameterizedAgent
 
-    policy = RandomForestModel(n_estimators=10, random_state=42)
+    n_estimators = model_config.get('params', {}).get('n_estimators', 10) if model_config.get('params') else 10
+    
+    policy = RandomForestModel(n_estimators=n_estimators, random_state=42)
     agent = ParameterizedAgent(policy_model=policy, seed=42)
     agent.load_checkpoint(checkpoint_path)
 
+    reward_name = model_config.get('reward_function', 'asymmetric_high_water_mark')
+    reward_fn_class = _registry.get('rewards', {}).get(reward_name)
+    if reward_fn_class is None:
+        reward_fn_class = AsymmetricHighWaterMarkReward
+    reward_fn = reward_fn_class()
+
+    sizer_name = agent_config.get('sizer', 'kelly')
+    sizer_class = _registry.get('sizers', {}).get(sizer_name)
+    if sizer_class is None:
+        sizer_class = KellySizer
+    sizer = sizer_class()
+
     capital = backtest_config.get('capital', 100000.0)
     commission = backtest_config.get('commission', 0.001)
+    symbol = list(agent_config.get('tradable', ['UNKNOWN']))[0] if agent_config.get('tradable') else 'UNKNOWN'
 
     transaction_costs = TransactionCosts(commission_rate=commission)
 
     engine = BacktestEngine(
         config=backtest_config,
         agent=agent,
-        sizer=KellySizer(),
-        reward_function=AsymmetricHighWaterMarkReward(),
+        sizer=sizer,
+        reward_function=reward_fn,
         transaction_costs=transaction_costs
     )
 
-    def execute_bar_fn(bar_idx, bar_data):
-        return {'portfolio_value': engine.portfolio_value, 'position': engine.position}
+    def execute_bar_fn(bar_idx, bar_data, portfolio=None):
+        current_price = float(bar_data[-1]) if len(bar_data) > 0 else 100.0
+        
+        portfolio_state = {
+            'portfolio_value': engine.portfolio_value,
+            'position': engine.position,
+            'unrealized_pnl': 0.0,
+            'realized_pnl': 0.0,
+            'drawdown': engine.drawdown,
+            'high_water_mark': engine.high_water_mark,
+            'bars_in_trade': 0
+        }
+        
+        observation = bar_data
+        
+        action, conviction = agent.observe(observation, portfolio_state, bar_idx)
+        
+        quantity = sizer.calculate_size(
+            action=action,
+            conviction=conviction,
+            current_position=engine.position,
+            portfolio_value=engine.portfolio_value,
+            instrument_id=symbol,
+            current_price=current_price
+        )
+        
+        return {
+            'action': action,
+            'quantity': quantity,
+            'price': current_price,
+            'symbol': symbol,
+            'portfolio_value': engine.portfolio_value,
+            'position': engine.position
+        }
 
     test_start_idx = int(len(data) * 0.7)
 

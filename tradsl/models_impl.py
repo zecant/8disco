@@ -7,23 +7,69 @@ from typing import Optional, Dict, Any, Type
 import numpy as np
 import joblib
 import os
+from sklearn.preprocessing import StandardScaler
 
 from tradsl.models import BaseTrainableModel
 
 
-class SklearnModel(BaseTrainableModel):
+class ScalerMixin:
+    """Mixin that adds feature normalization to models."""
+    
+    def _init_scaler(self):
+        """Initialize the scaler."""
+        self.scaler = StandardScaler()
+        self._scaler_fitted = False
+    
+    def _fit_scaler(self, features: np.ndarray) -> np.ndarray:
+        """Fit scaler on features and return scaled features."""
+        valid_mask = ~np.isnan(features).any(axis=1) if features.ndim > 1 else ~np.isnan(features)
+        if not np.any(valid_mask):
+            return features
+        
+        valid_features = features[valid_mask]
+        if len(valid_features) > 0:
+            self.scaler.fit(valid_features)
+            self._scaler_fitted = True
+        
+        return features
+    
+    def _transform_features(self, features: np.ndarray) -> np.ndarray:
+        """Transform features using fitted scaler."""
+        if not self._scaler_fitted:
+            return features
+        
+        try:
+            return self.scaler.transform(features)
+        except Exception:
+            return features
+    
+    def _save_scaler(self, path: str) -> None:
+        """Save scaler to path."""
+        if self._scaler_fitted:
+            joblib.dump(self.scaler, path)
+    
+    def _load_scaler(self, path: str) -> None:
+        """Load scaler from path."""
+        if os.path.exists(path):
+            self.scaler = joblib.load(path)
+            self._scaler_fitted = True
+
+
+class SklearnModel(ScalerMixin, BaseTrainableModel):
     """
     Thin wrapper around any scikit-learn estimator.
     
     Handles fit/predict delegation and checkpoint serialization via joblib.
     Model class is configured via params.
+    Includes automatic feature normalization via StandardScaler.
     """
     
     def __init__(
         self,
         model_class: Optional[Type] = None,
         params: Optional[Dict[str, Any]] = None,
-        model_type: str = "regressor"
+        model_type: str = "regressor",
+        normalize: bool = True
     ):
         """
         Initialize sklearn model.
@@ -32,13 +78,18 @@ class SklearnModel(BaseTrainableModel):
             model_class: sklearn estimator class (e.g., RandomForestRegressor)
             params: Dict of model hyperparameters
             model_type: 'regressor' or 'classifier'
+            normalize: Whether to apply feature normalization (default True)
         """
         self.model_class = model_class
         self.params = params or {}
         self.model_type = model_type
+        self.normalize = normalize
         
         self._model = None
         self._is_fitted = False
+        
+        if self.normalize:
+            self._init_scaler()
         
         if model_class is not None:
             self._model = model_class(**self.params)
@@ -58,6 +109,9 @@ class SklearnModel(BaseTrainableModel):
         if len(X) == 0:
             return
         
+        if self.normalize:
+            X = self._fit_scaler(X)
+        
         self._model.fit(X, y)
         self._is_fitted = True
     
@@ -68,6 +122,10 @@ class SklearnModel(BaseTrainableModel):
         
         try:
             X = features.reshape(1, -1)
+            
+            if self.normalize:
+                X = self._transform_features(X)
+            
             pred = self._model.predict(X)
             
             if self.model_type == "classifier":
@@ -82,12 +140,17 @@ class SklearnModel(BaseTrainableModel):
     def save_checkpoint(self, path: str) -> None:
         """Save model state to file."""
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        joblib.dump({
+        checkpoint = {
             'model': self._model,
             'params': self.params,
             'model_type': self.model_type,
-            'is_fitted': self._is_fitted
-        }, path)
+            'is_fitted': self._is_fitted,
+            'normalize': self.normalize
+        }
+        if self.normalize and self._scaler_fitted:
+            checkpoint['scaler'] = self.scaler
+            checkpoint['scaler_fitted'] = self._scaler_fitted
+        joblib.dump(checkpoint, path)
     
     def load_checkpoint(self, path: str) -> None:
         """Load model state from file."""
@@ -96,6 +159,12 @@ class SklearnModel(BaseTrainableModel):
         self.params = data['params']
         self.model_type = data['model_type']
         self._is_fitted = data['is_fitted']
+        self.normalize = data.get('normalize', True)
+        if self.normalize:
+            self._init_scaler()
+            if 'scaler' in data:
+                self.scaler = data['scaler']
+                self._scaler_fitted = data.get('scaler_fitted', True)
     
     @property
     def is_fitted(self) -> bool:

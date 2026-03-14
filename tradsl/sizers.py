@@ -193,15 +193,15 @@ class KellySizer(BasePositionSizer):
             return 0.0
         if action == TradingAction.HOLD:
             return current_position
-        if action == TradingAction.HOLD:
-            return current_position
         
-        p = conviction * self.estimated_win_rate
+        p = self.estimated_win_rate
         q = 1 - p
         b = self.win_loss_ratio
         
         kelly = (p * b - q) / b
         kelly = max(0, min(kelly, self.max_kelly))
+        
+        kelly = kelly * conviction
         
         direction = 1.0
         if action == TradingAction.SELL:

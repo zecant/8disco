@@ -507,9 +507,14 @@ class TradSLNTStrategy:
             inputs = node_config.get('inputs', [])
             
             input_values = []
+            input_arrays = []
             for inp in inputs:
                 if inp in self._state.node_outputs:
                     input_values.append(self._state.node_outputs[inp])
+                if inp in self._state.node_buffers:
+                    buf = self._state.node_buffers[inp]
+                    arr = buf.to_array()
+                    input_arrays.append(arr)
             
             if not input_values or None in input_values:
                 continue
@@ -517,7 +522,7 @@ class TradSLNTStrategy:
             if len(input_values) == 1:
                 output = self._compute_node(node_name, input_values[0])
             else:
-                output = self._compute_node_multi(node_name, input_values)
+                output = self._compute_node_multi(node_name, input_values, input_arrays)
             
             if output is not None:
                 self._state.node_outputs[node_name] = output
@@ -547,9 +552,54 @@ class TradSLNTStrategy:
         except Exception:
             return None
     
-    def _compute_node_multi(self, node_name: str, input_values: List[float]) -> Optional[float]:
-        """Compute a multi-input function node."""
-        return input_values[0] if input_values else None
+    def _compute_node_multi(
+        self, 
+        node_name: str, 
+        input_values: List[float],
+        input_arrays: List[Optional[np.ndarray]]
+    ) -> Optional[float]:
+        """Compute a multi-input function node.
+        
+        Multi-input functions receive:
+        - current scalar values (input_values) for stateless computations
+        - full arrays (input_arrays) for rolling/windowed computations
+        
+        The function signature determines what it receives:
+        - def f(val1, val2, **params) - receives scalars
+        - def f(arr1, arr2, **params) - receives arrays
+        
+        The function is called with *args based on its signature.
+        """
+        node_config = self._config.dag_config.get(node_name, {})
+        func_name = node_config.get('function')
+        params = node_config.get('params', {})
+        
+        if not func_name:
+            return None
+        
+        if None in input_values:
+            return None
+        
+        try:
+            from tradsl.functions import get_function
+            spec = get_function(func_name)
+            if spec is None:
+                logger.warning(f"Unknown multi-input function: {func_name}")
+                return None
+            
+            import inspect
+            sig = inspect.signature(spec.func)
+            n_params = len(sig.parameters)
+            
+            if n_params >= 2 and input_arrays and all(arr is not None for arr in input_arrays):
+                result = spec.func(*input_arrays, **params)
+            else:
+                result = spec.func(*input_values, **params)
+            
+            return result
+        except Exception as e:
+            logger.debug(f"Error computing multi-input function {func_name}: {e}")
+            return None
     
     def _assemble_observation(self) -> Optional[np.ndarray]:
         """Assemble observation vector from node outputs."""
