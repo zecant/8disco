@@ -4,8 +4,6 @@ Circular Buffer for Incremental Feature Computation
 Fixed-size circular buffer for time series values. Provides O(1) push
 and O(window) slice access for feature computation.
 """
-from typing import Optional
-import numpy as np
 
 
 class CircularBuffer:
@@ -25,13 +23,13 @@ class CircularBuffer:
         The engine checks warmup state before computing any node.
     """
 
-    def __init__(self, size: int, dtype=np.float64):
+    def __init__(self, size: int):
         if size <= 0:
             raise ValueError("Buffer size must be positive")
-        self._data = np.full(size, np.nan, dtype=dtype)
         self._size = size
         self._head = 0
         self._count = 0
+        self._data: list = [None] * size
 
     @property
     def size(self) -> int:
@@ -43,7 +41,7 @@ class CircularBuffer:
         """Number of elements currently in buffer."""
         return self._count
 
-    def push(self, value: float) -> None:
+    def push(self, value) -> None:
         """Push new value. Overwrites oldest. O(1)."""
         self._data[self._head] = value
         self._head = (self._head + 1) % self._size
@@ -55,26 +53,28 @@ class CircularBuffer:
         """True when buffer has received exactly `size` values."""
         return self._count >= self._size
 
-    def latest(self) -> Optional[float]:
+    def latest(self):
         """Most recent value. O(1). Returns None if not ready."""
         if not self.is_ready:
             return None
         return self._data[(self._head - 1) % self._size]
 
-    def to_array(self) -> Optional[np.ndarray]:
+    def contents(self) -> list:
         """
-        Return buffer contents as array oldest-to-newest. O(size).
-        Returns None if not ready.
-
-        arr[-1] is the most recent value (current bar).
-        arr[-2] is one bar ago. Never contains future values.
+        Return all buffer contents as list oldest-to-newest.
+        Returns list padded with None if not full.
         """
-        if not self.is_ready:
-            return None
-        idx = self._head
-        return np.concatenate([self._data[idx:], self._data[:idx]])
+        if self._count == 0:
+            return [None] * self._size
+        result = []
+        for i in range(self._count):
+            idx = (self._head - self._count + i) % self._size
+            result.append(self._data[idx])
+        while len(result) < self._size:
+            result.insert(0, None)
+        return result
 
-    def __getitem__(self, idx: int) -> float:
+    def __getitem__(self, idx: int):
         """Access element by index from oldest (0) to newest (-1 or size-1)."""
         if idx < 0:
             idx = self._count + idx
