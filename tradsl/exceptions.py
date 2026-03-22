@@ -113,3 +113,25 @@ class ResolutionError(TradSLException):
         if key:
             message += f" (at key '{key}')"
         super().__init__(message)
+
+
+class InvariantError(TradSLException):
+    """
+    Raised when a required invariant is violated.
+
+    Attributes:
+        invariant: Description of the invariant that was violated.
+        node: Node name where the violation occurred.
+    """
+
+    def __init__(
+        self,
+        invariant: str,
+        node: str | None = None
+    ):
+        self.invariant = invariant
+        self.node = node
+        message = f"Invariant violated: {invariant}"
+        if node:
+            message += f" (in node '{node}')"
+        super().__init__(message)

@@ -11,7 +11,7 @@ import pandas as pd
 
 from tradsl.adapters import Adapter
 from tradsl.circular_buffer import CircularBuffer
-from tradsl.exceptions import CycleError, ConfigError, ResolutionError
+from tradsl.exceptions import CycleError, ConfigError, InvariantError, ResolutionError
 from tradsl.functions import Function
 
 
@@ -142,6 +142,47 @@ class DAG:
                         node=name,
                         key="inputs"
                     )
+    
+    def validate_agent_invariant(self) -> None:
+        """
+        Validate that the DAG ends with agent + portfolio executor (last 2 nodes).
+        
+        Raises:
+            InvariantError: If the last two nodes don't match the pattern.
+        """
+        if len(self.execution_order) < 2:
+            raise InvariantError(
+                "DAG must have at least 2 nodes (agent + executor)",
+            )
+        
+        agent_name = self.execution_order[-2]
+        executor_name = self.execution_order[-1]
+        agent_node = self.nodes[agent_name]
+        executor_node = self.nodes[executor_name]
+        
+        if agent_node.type != "function" or agent_node.function is None:
+            raise InvariantError(
+                "Second-to-last node must be an agent (ml.agents.*)",
+                node=agent_name
+            )
+        
+        if not agent_node.function.startswith("ml.agents."):
+            raise InvariantError(
+                "Second-to-last node must be an agent (ml.agents.*)",
+                node=agent_name
+            )
+        
+        if executor_node.type != "function" or executor_node.function is None:
+            raise InvariantError(
+                "Last node must be a portfolio executor (portfolio.*)",
+                node=executor_name
+            )
+        
+        if not executor_node.function.startswith("portfolio."):
+            raise InvariantError(
+                "Last node must be a portfolio executor (portfolio.*)",
+                node=executor_name
+            )
 
     def detect_cycles(self) -> None:
         """
@@ -166,6 +207,7 @@ class DAG:
                         current = parent[current]
                         if current:
                             path.append(current)
+                    path.append(neighbor)
                     path.reverse()
                     raise CycleError(path)
                 if color[neighbor] == WHITE:
@@ -229,10 +271,9 @@ class DAG:
 
         Algorithm:
             1. Initialize buffer_map: all 0
-            2. Last node (sink) gets buffer = 1 (no dependents)
-            3. Process nodes in reverse topological order
-            4. For each dependency: buffer_map[dep] = max(buffer_map[dep], node.window)
-            5. Set each node's buffer_size to max(buffer_map[name], node.window)
+            2. Sink node gets buffer = 1
+            3. For each dependency: buffer_map[dep] = max(buffer_map[dep], node.window)
+            4. Set each node's buffer_size from buffer_map
         """
         if not self.execution_order:
             self.topological_sort()
@@ -249,6 +290,19 @@ class DAG:
 
         for name in self.nodes:
             self.nodes[name].buffer_size = buffer_map[name]
+
+    def _resolve_sizing_fn(self, name: str, registry: dict) -> Any:
+        if name is None:
+            return None
+        if "." in name:
+            parts = name.split(".")
+            obj = registry.get(parts[0])
+            if obj is None:
+                obj = __import__(parts[0], fromlist=[""])
+            for part in parts[1:]:
+                obj = getattr(obj, part)
+            return obj
+        return registry.get(name)
 
     def resolve(self, registry: dict[str, Any]) -> None:
         """
@@ -283,39 +337,55 @@ class DAG:
                 return True
             return name in registry
 
-        def instantiate(cls_or_instance, attrs: dict) -> Any:
+        def instantiate(cls_or_instance, attrs: dict, auto_state=None) -> Any:
             if isinstance(cls_or_instance, type):
                 kwargs = {}
+                sizing_fn_cls = None
+                sizing_params = {}
+                
                 for key, value in attrs.items():
                     if key in ("type", "function", "adapter", "inputs"):
                         continue
-                    kwargs[key] = value
+                    if key == "sizing_fn":
+                        sizing_fn_cls = self._resolve_sizing_fn(value, registry)
+                    elif key == "sizing_params":
+                        sizing_params = value
+                    else:
+                        kwargs[key] = value
+                
+                if auto_state is not None:
+                    import inspect
+                    sig = inspect.signature(cls_or_instance.__init__)
+                    if "state" in sig.parameters:
+                        kwargs["state"] = auto_state
+                
+                if sizing_fn_cls is not None:
+                    kwargs["sizing_fn"] = sizing_fn_cls
+                    kwargs["sizing_params"] = sizing_params
+                
                 return cls_or_instance(**kwargs)
             return cls_or_instance
+        
+        def resolve_dotted(name: str, reg: dict) -> Any:
+            if "." in name:
+                parts = name.split(".")
+                obj = reg[parts[0]]
+                for part in parts[1:]:
+                    obj = getattr(obj, part)
+                return obj
+            return reg.get(name)
 
         for node in self.nodes.values():
             if node.type == "function" and node.function is not None:
                 if not can_resolve(node.function):
                     raise ResolutionError(node.function, node=node.name, key="function")
 
+        auto_states = []
         for name in self.execution_order:
             if name not in self.nodes:
                 continue
 
             node = self.nodes[name]
-
-            if node.type == "function" and node.function is not None:
-                func_name = node.function
-                if "." in func_name:
-                    parts = func_name.split(".")
-                    obj = registry[parts[0]]
-                    for part in parts[1:]:
-                        obj = getattr(obj, part)
-                    resolved_fn = instantiate(obj, node.attrs)
-                else:
-                    resolved_fn = instantiate(registry[func_name], node.attrs)
-                node.attrs["function"] = resolved_fn
-                self._function_registry[name] = resolved_fn
 
             if node.type == "timeseries" and node.adapter is not None:
                 adapter_name = node.adapter
@@ -330,9 +400,32 @@ class DAG:
                         resolved_adapter = instantiate(registry[adapter_name], node.attrs)
                     node.attrs["adapter"] = resolved_adapter
                     self._adapter_registry[name] = resolved_adapter
+                    if hasattr(resolved_adapter, "state"):
+                        auto_states.append(resolved_adapter.state)
 
             if node.buffer_size and node.buffer_size > 0:
                 self._buffers[name] = CircularBuffer(size=node.buffer_size)
+
+        default_state = auto_states[0] if auto_states else None
+
+        for name in self.execution_order:
+            if name not in self.nodes:
+                continue
+
+            node = self.nodes[name]
+
+            if node.type == "function" and node.function is not None:
+                func_name = node.function
+                if "." in func_name:
+                    parts = func_name.split(".")
+                    obj = registry[parts[0]]
+                    for part in parts[1:]:
+                        obj = getattr(obj, part)
+                    resolved_fn = instantiate(obj, node.attrs, auto_state=default_state)
+                else:
+                    resolved_fn = instantiate(registry[func_name], node.attrs, auto_state=default_state)
+                node.attrs["function"] = resolved_fn
+                self._function_registry[name] = resolved_fn
 
     def step(self) -> None:
         """Advance the DAG by one tick."""
@@ -364,7 +457,7 @@ class DAG:
         columns = []
         for dep in input_names:
             contents = self._get_buffer_contents(dep)
-            columns.append(contents if contents else [None] * self._buffers[dep].size)
+            columns.append(contents if contents is not None else [None] * self._buffers[dep].size)
         
         max_len = max(len(c) for c in columns) if columns else 0
         padded = []
@@ -396,9 +489,13 @@ class DAG:
                 result.append((name, None))
         return result
 
-    def build(self) -> "DAG":
+    def build(self, validate_agent: bool = False) -> "DAG":
         """
         Full DAG build pipeline: validate, detect cycles, sort, compute buffers.
+
+        Args:
+            validate_agent: If True, enforce that sink node is ml.agents.*.
+                           Set to False for non-trading DAGs (analysis, etc).
 
         Returns:
             Self for method chaining.
@@ -406,5 +503,7 @@ class DAG:
         self.validate()
         self.detect_cycles()
         self.topological_sort()
+        if validate_agent:
+            self.validate_agent_invariant()
         self.compute_buffer_sizes()
         return self
