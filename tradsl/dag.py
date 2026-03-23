@@ -6,7 +6,8 @@ computes topological sort, calculates buffer sizes, and resolves references.
 """
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from datetime import datetime
+from typing import Any, Optional, Union
 import pandas as pd
 
 from tradsl.adapters import Adapter
@@ -63,6 +64,7 @@ class DAG:
         self._buffers: dict[str, CircularBuffer] = {}
         self._function_registry: dict[str, Function] = {}
         self._adapter_registry: dict[str, Adapter] = {}
+        self._current_timestamp: datetime | None = None
 
     @classmethod
     def from_config(cls, config: dict[str, dict[str, Any]]) -> "DAG":
@@ -337,11 +339,12 @@ class DAG:
                 return True
             return name in registry
 
-        def instantiate(cls_or_instance, attrs: dict, auto_state=None) -> Any:
+        def instantiate(cls_or_instance, attrs: dict, auto_state=None, is_adapter=False) -> Any:
             if isinstance(cls_or_instance, type):
                 kwargs = {}
                 sizing_fn_cls = None
                 sizing_params = {}
+                execution_model_cls = None
                 
                 for key, value in attrs.items():
                     if key in ("type", "function", "adapter", "inputs"):
@@ -350,6 +353,8 @@ class DAG:
                         sizing_fn_cls = self._resolve_sizing_fn(value, registry)
                     elif key == "sizing_params":
                         sizing_params = value
+                    elif key == "execution_model":
+                        execution_model_cls = self._resolve_sizing_fn(value, registry)
                     else:
                         kwargs[key] = value
                 
@@ -362,6 +367,12 @@ class DAG:
                 if sizing_fn_cls is not None:
                     kwargs["sizing_fn"] = sizing_fn_cls
                     kwargs["sizing_params"] = sizing_params
+                
+                if execution_model_cls is not None:
+                    kwargs["execution_model"] = execution_model_cls
+                
+                if is_adapter:
+                    kwargs["dag"] = self
                 
                 return cls_or_instance(**kwargs)
             return cls_or_instance
@@ -395,9 +406,9 @@ class DAG:
                         obj = registry[parts[0]]
                         for part in parts[1:]:
                             obj = getattr(obj, part)
-                        resolved_adapter = instantiate(obj, node.attrs)
+                        resolved_adapter = instantiate(obj, node.attrs, is_adapter=True)
                     else:
-                        resolved_adapter = instantiate(registry[adapter_name], node.attrs)
+                        resolved_adapter = instantiate(registry[adapter_name], node.attrs, is_adapter=True)
                     node.attrs["adapter"] = resolved_adapter
                     self._adapter_registry[name] = resolved_adapter
                     if hasattr(resolved_adapter, "state"):
@@ -453,24 +464,41 @@ class DAG:
                 self._push_to_buffer(name, value)
 
     def _glue_inputs(self, input_names: list[str]) -> pd.DataFrame:
-        """Join all input buffers into a single DataFrame."""
-        columns = []
+        """Join all input buffers into a single DataFrame with prefixed columns and timestamp alignment."""
+        dfs = []
         for dep in input_names:
             contents = self._get_buffer_contents(dep)
-            columns.append(contents if contents is not None else [None] * self._buffers[dep].size)
-        
-        max_len = max(len(c) for c in columns) if columns else 0
-        padded = []
-        for c in columns:
-            if len(c) < max_len:
-                padded.append([None] * (max_len - len(c)) + c)
+            if contents is None:
+                continue
+            
+            if isinstance(contents, pd.DataFrame):
+                contents = contents.copy()
+                contents.columns = [f"{dep}.{col}" for col in contents.columns]
+                dfs.append(contents)
             else:
-                padded.append(c)
+                df = pd.DataFrame({dep: contents})
+                dfs.append(df)
         
-        return pd.DataFrame(dict(zip(input_names, padded)))
+        if not dfs:
+            return pd.DataFrame()
+        
+        result = dfs[0]
+        for df in dfs[1:]:
+            if isinstance(result.index, pd.DatetimeIndex) and isinstance(df.index, pd.DatetimeIndex):
+                result = pd.merge_asof(
+                    result.sort_index(),
+                    df.sort_index(),
+                    left_index=True,
+                    right_index=True,
+                    direction='nearest'
+                )
+            else:
+                result = pd.concat([result, df], axis=1)
+        
+        return result
 
-    def _get_buffer_contents(self, name: str) -> Optional[list]:
-        """Get buffer contents in oldest-to-newest order, padded with None if partial."""
+    def _get_buffer_contents(self, name: str) -> Optional[Union[list, pd.DataFrame]]:
+        """Get buffer contents in oldest-to-newest order."""
         if name in self._buffers:
             return self._buffers[name].contents()
         return None

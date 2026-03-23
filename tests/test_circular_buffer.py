@@ -137,11 +137,20 @@ class TestLatest:
 class TestContents:
     """Tests for contents() method."""
 
+    def test_returns_none_when_empty(self):
+        buf = CircularBuffer(3)
+        assert buf.contents() is None
+    
     def test_returns_padded_list_before_ready(self):
         buf = CircularBuffer(3)
-        assert buf.contents() == [None, None, None]
         buf.push(1.0)
         assert buf.contents() == [None, None, 1.0]
+    
+    def test_returns_padded_list_for_non_dataframe(self):
+        buf = CircularBuffer(3)
+        buf.push(1.0)
+        buf.push(2.0)
+        assert buf.contents() == [None, 1.0, 2.0]
 
     def test_returns_list_after_ready(self):
         buf = CircularBuffer(3)
