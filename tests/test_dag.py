@@ -14,7 +14,6 @@ class TestNodeConstruction:
         assert node.name == "ts"
         assert node.type == "timeseries"
         assert node.adapter == "a"
-        assert node.window == 1
 
     def test_function_node(self):
         node = Node(name="fn", type="function", function="avg", inputs=["a", "b"])
@@ -22,10 +21,6 @@ class TestNodeConstruction:
         assert node.type == "function"
         assert node.function == "avg"
         assert node.inputs == ["a", "b"]
-
-    def test_custom_window(self):
-        node = Node(name="n", type="function", window=30)
-        assert node.window == 30
 
     def test_invalid_type(self):
         with pytest.raises(ConfigError):
@@ -154,63 +149,6 @@ class TestTopologicalSort:
         assert dag.topological_sort() == ["a", "z"]
 
 
-class TestBufferSizeComputation:
-    """Tests for buffer size computation (BFS from sinks)."""
-
-    def test_single_node(self):
-        config = {"ts": {"type": "timeseries", "adapter": "a"}}
-        dag = DAG.from_config(config).build()
-        assert dag.nodes["ts"].buffer_size == 1
-
-    def test_simple_chain(self):
-        config = {
-            "ts": {"type": "timeseries", "adapter": "a"},
-            "fn": {"type": "function", "function": "f", "inputs": ["ts"], "window": 5},
-        }
-        dag = DAG.from_config(config).build()
-        assert dag.nodes["fn"].buffer_size == 1
-        assert dag.nodes["ts"].buffer_size == 5
-
-    def test_chain_with_windows(self):
-        config = {
-            "ts": {"type": "timeseries", "adapter": "a"},
-            "fn1": {"type": "function", "function": "f", "inputs": ["ts"], "window": 5},
-            "fn2": {"type": "function", "function": "g", "inputs": ["fn1"], "window": 20},
-            "fn3": {"type": "function", "function": "h", "inputs": ["fn2"]},
-        }
-        dag = DAG.from_config(config).build()
-        assert dag.nodes["fn3"].buffer_size == 1
-        assert dag.nodes["fn2"].buffer_size == 1
-        assert dag.nodes["fn1"].buffer_size == 20
-        assert dag.nodes["ts"].buffer_size == 5
-
-    def test_parallel_branches(self):
-        config = {
-            "data": {"type": "timeseries", "adapter": "a"},
-            "fast": {"type": "function", "function": "f", "inputs": ["data"], "window": 5},
-            "slow": {"type": "function", "function": "g", "inputs": ["data"], "window": 20},
-            "signal": {"type": "function", "function": "h", "inputs": ["fast", "slow"]},
-        }
-        dag = DAG.from_config(config).build()
-        assert dag.nodes["signal"].buffer_size == 1
-        assert dag.nodes["fast"].buffer_size == 1
-        assert dag.nodes["slow"].buffer_size == 1
-        assert dag.nodes["data"].buffer_size == 20
-
-    def test_diamond(self):
-        config = {
-            "a": {"type": "timeseries", "adapter": "a"},
-            "b": {"type": "function", "function": "f", "inputs": ["a"], "window": 10},
-            "c": {"type": "function", "function": "g", "inputs": ["a"], "window": 5},
-            "d": {"type": "function", "function": "h", "inputs": ["b", "c"]},
-        }
-        dag = DAG.from_config(config).build()
-        assert dag.nodes["d"].buffer_size == 1
-        assert dag.nodes["b"].buffer_size == 1
-        assert dag.nodes["c"].buffer_size == 1
-        assert dag.nodes["a"].buffer_size == 10
-
-
 class TestResolution:
     """Tests for resolution."""
 
@@ -248,17 +186,6 @@ class TestResolution:
         with pytest.raises(ResolutionError):
             dag.resolve(registry)
 
-    def test_preserves_buffers(self):
-        config = {
-            "ts": {"type": "timeseries", "adapter": "a", "window": 10},
-            "fn": {"type": "function", "function": "f", "inputs": ["ts"]},
-        }
-        dag = DAG.from_config(config).build()
-        registry = {"f": lambda x: x}
-        dag.resolve(registry)
-        assert dag.nodes["fn"].buffer_size == 1
-        assert dag.nodes["ts"].buffer_size == 1
-
 
 class TestBuildPipeline:
     """Tests for full build pipeline."""
@@ -276,83 +203,6 @@ class TestBuildPipeline:
             dag.build()
 
 
-class TestIntegration:
-    """Integration tests with parser."""
-
-    def test_crossover_strategy(self):
-        from tradsl.parser import parse
-
-        dsl = """
-price:
-type=timeseries
-adapter=yfinance
-
-sma_30:
-type=function
-function=sma
-inputs=[price]
-window=30
-
-sma_5:
-type=function
-function=sma
-inputs=[price]
-window=5
-
-signal:
-type=function
-function=crossover
-inputs=[sma_30, sma_5]
-"""
-        config = parse(dsl)
-        dag = DAG.from_config(config).build()
-
-        assert dag.execution_order[-1] == "signal"
-        assert dag.nodes["signal"].buffer_size == 1
-        assert dag.nodes["sma_30"].buffer_size == 1
-        assert dag.nodes["sma_5"].buffer_size == 1
-        assert dag.nodes["price"].buffer_size == 30
-
-    def test_complex_strategy(self):
-        from tradsl.parser import parse
-
-        dsl = """
-ohlcv:
-type=timeseries
-adapter=yfinance
-
-close:
-type=function
-function=close
-inputs=[ohlcv]
-
-ma_fast:
-type=function
-function=ma
-inputs=[close]
-window=10
-
-ma_slow:
-type=function
-function=ma
-inputs=[close]
-window=50
-
-agent:
-type=function
-function=agent
-inputs=[ma_fast, ma_slow]
-"""
-        config = parse(dsl)
-        dag = DAG.from_config(config).build()
-
-        assert dag.nodes["agent"].buffer_size == 1
-        assert dag.nodes["ma_fast"].buffer_size == 1
-        assert dag.nodes["ma_slow"].buffer_size == 1
-        assert dag.nodes["close"].buffer_size == 50
-        assert dag.nodes["ohlcv"].buffer_size == 1
-
-
 class TestFuzz:
     """Randomized tests."""
 
@@ -366,7 +216,6 @@ class TestFuzz:
                 config[f"n{i}"] = {
                     "type": "timeseries",
                     "adapter": f"a{i}",
-                    "window": random.randint(1, 10),
                 }
             else:
                 num_inputs = random.randint(1, min(3, i))
@@ -375,40 +224,8 @@ class TestFuzz:
                     "type": "function",
                     "function": f"f{i}",
                     "inputs": inputs,
-                    "window": random.randint(1, 20),
                 }
 
         dag = DAG.from_config(config)
         dag.build()
         assert len(dag.execution_order) == 20
-
-    def test_deep_chain(self):
-        config = {}
-        for i in range(100):
-            if i == 0:
-                config[f"n{i}"] = {"type": "timeseries", "adapter": "a"}
-            else:
-                config[f"n{i}"] = {
-                    "type": "function",
-                    "function": f"f{i}",
-                    "inputs": [f"n{i-1}"],
-                    "window": 1,
-                }
-        config["n99"]["window"] = 100
-
-        dag = DAG.from_config(config).build()
-        assert dag.nodes["n0"].buffer_size == 1
-        assert dag.nodes["n99"].buffer_size == 1
-
-    def test_wide_graph(self):
-        config = {f"leaf{i}": {"type": "timeseries", "adapter": "a", "window": i + 1} for i in range(10)}
-        config["root"] = {
-            "type": "function",
-            "function": "combine",
-            "inputs": [f"leaf{i}" for i in range(10)],
-        }
-
-        dag = DAG.from_config(config).build()
-        assert dag.nodes["root"].buffer_size == 1
-        assert dag.nodes["leaf9"].buffer_size == 1
-        assert dag.nodes["leaf0"].buffer_size == 1

@@ -5,63 +5,68 @@ A declarative configuration language for building and backtesting trading strate
 that compiles to an executable DAG (Directed Acyclic Graph).
 
 Example usage:
-    from tradsl import DAG, parse, default_registry
+    from tradsl import DAG, parse
 
     config = parse('''
         price:
             type=timeseries
-            adapter=yfinance
+            adapter=parquet
+            path=/data/prices/aapl.parquet
             symbol=AAPL
-
-        sma:
-            type=function
-            function=pricetransforms.ema
-            inputs=[price]
-            window=20
     ''')
 
     dag = DAG.from_config(config)
-    dag.resolve(default_registry)
     dag.build()
+    dag.resolve(default_registry)
 
-    dag.step()
-    print(dag.values())
+    from tradsl.storage import ClickHouseConnection
+    conn = ClickHouseConnection()
+    results = dag.execute(conn)
 """
 from tradsl.dag import DAG, Node
-from tradsl.exceptions import CycleError, ConfigError, InvariantError, ResolutionError
-from tradsl.functions import Function
-from tradsl.adapters import Adapter, YFinanceAdapter
-from tradsl.portfolio_adapter import PortfolioAdapter
-from tradsl.portfolio_state import PortfolioState
-from tradsl.portfolio_function import PortfolioFunction
+from tradsl.exceptions import CycleError, ConfigError, ResolutionError
+from tradsl.functions import (
+    TimeSeriesFunction,
+    Function,
+    SignalType,
+    Lag,
+    EMA,
+    SMA,
+    Returns,
+    ExternalFunction,
+)
+from tradsl.adapters import Adapter, ParquetAdapter, CSVAdapter
+from tradsl.storage import ClickHouseConnection
 
-__version__ = "0.0.3"
+__version__ = "0.0.4"
 
 __all__ = [
     "DAG",
     "Node",
+    "TimeSeriesFunction",
     "Function",
+    "SignalType",
+    "Lag",
+    "EMA",
+    "SMA",
+    "Returns",
+    "ExternalFunction",
     "Adapter",
-    "YFinanceAdapter",
-    "PortfolioAdapter",
-    "PortfolioState",
-    "PortfolioFunction",
+    "ParquetAdapter",
+    "CSVAdapter",
+    "ClickHouseConnection",
     "CycleError",
     "ConfigError",
-    "InvariantError",
     "ResolutionError",
     "default_registry",
 ]
 
 
-import tradsl.pricetransforms as pricetransforms
-import tradsl.ml as ml
-import tradsl.portfolio as portfolio
-
 default_registry: dict[str, object] = {
-    "pricetransforms": pricetransforms,
-    "ml": ml,
-    "portfolio": portfolio,
-    "yfinance": YFinanceAdapter,
-    "portfolioadapter": PortfolioAdapter,
+    "parquet": ParquetAdapter,
+    "csv": CSVAdapter,
+    "functions.lag": Lag,
+    "functions.ema": EMA,
+    "functions.sma": SMA,
+    "functions.returns": Returns,
 }
