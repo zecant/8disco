@@ -171,7 +171,7 @@ class CSVAdapter(Adapter):
         Returns:
             Table name in ClickHouse
         """
-        df = pd.read_csv(self.path)
+        df = pd.read_csv(self.path, sep=self.delimiter)
         
         self._create_table_from_df(conn, df)
         

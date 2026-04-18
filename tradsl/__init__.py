@@ -27,14 +27,12 @@ from tradsl.dag import DAG, Node
 from tradsl.exceptions import CycleError, ConfigError, ResolutionError
 from tradsl.functions import (
     TimeSeriesFunction,
-    Function,
     SignalType,
     Lag,
     EMA,
     SMA,
     Returns,
     LogReturn,
-    Mean,
     ExternalFunction,
 )
 from tradsl.adapters import Adapter, ParquetAdapter, CSVAdapter
@@ -46,14 +44,12 @@ __all__ = [
     "DAG",
     "Node",
     "TimeSeriesFunction",
-    "Function",
     "SignalType",
     "Lag",
     "EMA",
     "SMA",
     "Returns",
     "LogReturn",
-    "Mean",
     "ExternalFunction",
     "Adapter",
     "ParquetAdapter",
@@ -74,6 +70,5 @@ default_registry: dict[str, object] = {
     "functions.sma": SMA,
     "functions.returns": Returns,
     "functions.logreturn": LogReturn,
-    "functions.mean": Mean,
     "external.double": ExternalFunction,
 }

@@ -178,48 +178,8 @@ class TimeSeriesFunction(ABC):
     def _generate_output_table_name(self, prefix: str = "fn") -> str:
         """Generate a unique output table name."""
         return f"{prefix}_{uuid.uuid4().hex[:8]}"
-
-
-class Function(ABC):
-    """
-    Abstract base class for all transformation functions.
     
-    Functions operate on ClickHouse tables. They receive table names as input,
-    perform SQL operations, and return a new table name.
-    """
-    
-    def __init__(self, **kwargs):
-        self.params = kwargs
-        self._output_table = ""
-    
-    @abstractmethod
-    def apply(self, conn: "ClickHouseConnection", input_tables: dict[str, str]) -> str:
-        """
-        Apply function to input tables in ClickHouse.
-        
-        Args:
-            conn: ClickHouseConnection instance
-            input_tables: Dict mapping node names to their table names in ClickHouse
-            
-        Returns:
-            Table name in ClickHouse containing the output
-        """
-        pass
-    
-    @property
-    def output_table(self) -> str:
-        """Return the output table name."""
-        return self._output_table
-    
-    @output_table.setter
-    def output_table(self, value: str):
-        self._output_table = value
-    
-    def _generate_output_table_name(self, prefix: str = "fn") -> str:
-        """Generate a unique output table name."""
-        return f"{prefix}_{uuid.uuid4().hex[:8]}"
-    
-    def _create_and_insert(self, conn, output_table: str, columns_sql: str, select_sql: str) -> str:
+    def _create_and_insert(self, conn: "ClickHouseConnection", output_table: str, columns_sql: str, select_sql: str) -> str:
         """Create table and insert data using separate statements."""
         conn.execute(f"DROP TABLE IF EXISTS {output_table}")
         
@@ -268,21 +228,6 @@ class Lag(TimeSeriesFunction):
         """
         
         return self._create_and_insert(conn, output_table, columns, select)
-    
-    def _create_and_insert(self, conn, output_table: str, columns_sql: str, select_sql: str) -> str:
-        """Create table and insert data using separate statements."""
-        conn.execute(f"DROP TABLE IF EXISTS {output_table}")
-        
-        create_sql = f"""
-            CREATE TABLE {output_table} (
-                {columns_sql}
-            ) ENGINE = MergeTree()
-            ORDER BY timestamp
-        """
-        conn.execute(create_sql)
-        
-        conn.execute(f"INSERT INTO {output_table} {select_sql}")
-        return output_table
 
 
 class EMA(TimeSeriesFunction):
@@ -379,21 +324,6 @@ class SMA(TimeSeriesFunction):
         """
         
         return self._create_and_insert(conn, output_table, columns, select)
-    
-    def _create_and_insert(self, conn, output_table: str, columns_sql: str, select_sql: str) -> str:
-        """Create table and insert data using separate statements."""
-        conn.execute(f"DROP TABLE IF EXISTS {output_table}")
-        
-        create_sql = f"""
-            CREATE TABLE {output_table} (
-                {columns_sql}
-            ) ENGINE = MergeTree()
-            ORDER BY timestamp
-        """
-        conn.execute(create_sql)
-        
-        conn.execute(f"INSERT INTO {output_table} {select_sql}")
-        return output_table
 
 
 class Returns(TimeSeriesFunction):
@@ -532,21 +462,6 @@ class Mean(TimeSeriesFunction):
         """
         conn.execute(create_sql)
         conn.execute(f"INSERT INTO {output_table} {select}")
-        return output_table
-    
-    def _create_and_insert(self, conn, output_table: str, columns_sql: str, select_sql: str) -> str:
-        """Create table and insert data using separate statements."""
-        conn.execute(f"DROP TABLE IF EXISTS {output_table}")
-        
-        create_sql = f"""
-            CREATE TABLE {output_table} (
-                {columns_sql}
-            ) ENGINE = MergeTree()
-            ORDER BY timestamp
-        """
-        conn.execute(create_sql)
-        
-        conn.execute(f"INSERT INTO {output_table} {select_sql}")
         return output_table
 
 
