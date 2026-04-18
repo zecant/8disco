@@ -430,7 +430,109 @@ class Returns(TimeSeriesFunction):
             FROM {input_table}
         """
         
-        return self._create_and_insert(conn, output_table, columns, select)
+        conn.execute(f"DROP TABLE IF EXISTS {output_table}")
+        
+        create_sql = f"""
+            CREATE TABLE {output_table} (
+                {columns}
+            ) ENGINE = MergeTree()
+            ORDER BY timestamp
+        """
+        conn.execute(create_sql)
+        conn.execute(f"INSERT INTO {output_table} {select}")
+        return output_table
+
+
+class LogReturn(TimeSeriesFunction):
+    """
+    Calculate log returns (natural log of price ratio).
+    
+    Example:
+        log_return:
+            type=function
+            function=functions.logreturn
+            inputs=[price]
+            periods=1
+            column=close
+    """
+    
+    def __init__(self, periods: int = 1, column: str = "close", **kwargs):
+        super().__init__(columns=column, periods=periods, **kwargs)
+        self.periods = periods
+        self.column = column
+    
+    @property
+    def output_columns(self) -> list[tuple[str, str]]:
+        return [(f"log_return_{self.periods}", "Nullable(Float64)")]
+    
+    def apply(self, conn: "ClickHouseConnection", input_table: str) -> str:
+        output_table = self._generate_output_table_name("logreturn")
+        
+        col_name = f"log_return_{self.periods}"
+        columns = f"symbol String, timestamp DateTime64, {self.column} Float64, {col_name} Nullable(Float64)"
+        select = f"""
+            SELECT symbol, timestamp, {self.column},
+                   LN({self.column} / LAG({self.column}, {self.periods}) OVER (ORDER BY timestamp)) as {col_name}
+            FROM {input_table}
+        """
+        
+        conn.execute(f"DROP TABLE IF EXISTS {output_table}")
+        
+        create_sql = f"""
+            CREATE TABLE {output_table} (
+                {columns}
+            ) ENGINE = MergeTree()
+            ORDER BY timestamp
+        """
+        conn.execute(create_sql)
+        conn.execute(f"INSERT INTO {output_table} {select}")
+        return output_table
+
+
+class Mean(TimeSeriesFunction):
+    """
+    Calculate simple moving average (mean) over a window.
+    
+    Example:
+        mean:
+            type=function
+            function=functions.mean
+            inputs=[price]
+            window=20
+            column=close
+    """
+    
+    def __init__(self, window: int = 20, column: str = "close", **kwargs):
+        super().__init__(columns=column, window=window, **kwargs)
+        self.window = window
+        self.column = column
+    
+    @property
+    def output_columns(self) -> list[tuple[str, str]]:
+        return [(f"mean_{self.window}", "Nullable(Float64)")]
+    
+    def apply(self, conn: "ClickHouseConnection", input_table: str) -> str:
+        output_table = self._generate_output_table_name("mean")
+        
+        col_name = f"mean_{self.window}"
+        columns = f"symbol String, timestamp DateTime64, {self.column} Float64, {col_name} Nullable(Float64)"
+        select = f"""
+            SELECT symbol, timestamp, {self.column},
+                   AVG({self.column}) OVER (ORDER BY timestamp ROWS BETWEEN {self.window-1} PRECEDING AND CURRENT ROW) as {col_name}
+            FROM {input_table}
+        """
+        
+        conn.execute(f"DROP TABLE IF EXISTS {output_table}")
+        
+        create_sql = f"""
+            CREATE TABLE {output_table} (
+                {columns}
+            ) ENGINE = MergeTree()
+            ORDER BY timestamp
+        """
+        conn.execute(create_sql)
+        conn.execute(f"INSERT INTO {output_table} {select}")
+        return output_table
     
     def _create_and_insert(self, conn, output_table: str, columns_sql: str, select_sql: str) -> str:
         """Create table and insert data using separate statements."""

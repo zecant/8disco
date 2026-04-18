@@ -33,12 +33,14 @@ from tradsl.functions import (
     EMA,
     SMA,
     Returns,
+    LogReturn,
+    Mean,
     ExternalFunction,
 )
 from tradsl.adapters import Adapter, ParquetAdapter, CSVAdapter
 from tradsl.storage import ClickHouseConnection
 
-__version__ = "0.0.4"
+__version__ = "0.0.5"
 
 __all__ = [
     "DAG",
@@ -50,6 +52,8 @@ __all__ = [
     "EMA",
     "SMA",
     "Returns",
+    "LogReturn",
+    "Mean",
     "ExternalFunction",
     "Adapter",
     "ParquetAdapter",
@@ -69,4 +73,7 @@ default_registry: dict[str, object] = {
     "functions.ema": EMA,
     "functions.sma": SMA,
     "functions.returns": Returns,
+    "functions.logreturn": LogReturn,
+    "functions.mean": Mean,
+    "external.double": ExternalFunction,
 }

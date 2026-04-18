@@ -60,6 +60,7 @@ class DAG:
         self._function_registry: dict[str, Any] = {}
         self._adapter_registry: dict[str, Adapter] = {}
         self._table_names: dict[str, str] = {}
+        self._config_blocks: dict[str, dict[str, Any]] = {}
 
     @classmethod
     def from_config(cls, config: dict[str, dict[str, Any]]) -> "DAG":
@@ -71,10 +72,17 @@ class DAG:
 
         Returns:
             DAG instance with nodes built but not yet validated/sorted.
+        Also stores "config" type blocks in dag._config_blocks (not processed as nodes).
         """
         dag = cls()
         for name, attrs in config.items():
             node_type = attrs.get("type", "")
+            
+            # Store config blocks separately (not processed as DAG nodes)
+            if node_type == "config":
+                dag._config_blocks[name] = attrs.copy()
+                continue
+            
             if node_type not in ("timeseries", "function"):
                 continue
 
