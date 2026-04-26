@@ -234,17 +234,16 @@ class EMA(TimeSeriesFunction):
     """
     Exponential Moving Average function.
     
-    Note: ClickHouse's exponentialMovingAverage is time-based (different from 
-    trading EMA). This implementation uses pandas for compatibility with 
-    standard trading EMA calculations.
+    Uses ClickHouse's native exponentialMovingAverage as a window function.
+    The smoothing factor alpha = 2 / (window + 1) for trading-style EMA.
     
     Example:
         ema_20:
-            type=function
+            type:function
             function=functions.ema
-            inputs=[price]
-            window=20
-            column=close
+            inputs:[price]
+            window:20
+            column:close
     """
     
     def __init__(self, window: int = 20, column: str = "close", **kwargs):
@@ -259,32 +258,18 @@ class EMA(TimeSeriesFunction):
     def apply(self, conn: "ClickHouseConnection", input_table: str) -> str:
         output_table = self._generate_output_table_name("ema")
         
-        df = conn.query(f"SELECT symbol, timestamp, {self.column} FROM {input_table} ORDER BY timestamp")
+        ema_col_name = f"ema_{self.window}"
         
-        import pandas as pd
-        df[f"ema_{self.window}"] = df[self.column].ewm(span=self.window).mean()
+        alpha = 2.0 / (self.window + 1)
         
-        columns = f"symbol String, timestamp DateTime64, {self.column} Float64, ema_{self.window} Nullable(Float64)"
-        
-        conn.execute(f"DROP TABLE IF EXISTS {output_table}")
-        
-        create_sql = f"""
-            CREATE TABLE {output_table} (
-                {columns}
-            ) ENGINE = MergeTree()
-            ORDER BY timestamp
+        columns = f"symbol String, timestamp DateTime64, {self.column} Float64, {ema_col_name} Nullable(Float64)"
+        select = f"""
+            SELECT symbol, timestamp, {self.column},
+                   exponentialMovingAverage({alpha})({self.column}, toUnixTimestamp(timestamp)) OVER (ORDER BY timestamp ASC) as {ema_col_name}
+            FROM {input_table}
         """
-        conn.execute(create_sql)
         
-        import io
-        output = io.StringIO()
-        df.to_csv(output, sep='\t', header=False, index=False, na_rep='\\N')
-        output.seek(0)
-        
-        conn.execute(f"INSERT INTO {output_table} FORMAT TSV", data=output.getvalue())
-        
-        self._output_table = output_table
-        return output_table
+        return self._create_and_insert(conn, output_table, columns, select)
 
 
 class SMA(TimeSeriesFunction):
@@ -465,85 +450,184 @@ class Mean(TimeSeriesFunction):
         return output_table
 
 
-class ExternalFunction(TimeSeriesFunction):
+class Add(TimeSeriesFunction):
     """
-    Run arbitrary Python scripts in ClickHouse using the Executable table engine.
-    
-    The script receives data from ClickHouse via stdin and outputs results to stdout.
-    Data is passed in TabSeparated format.
+    Add two columns or a column and a scalar.
     
     Example:
-        # Define a simple script that doubles the input
-        script = '''
-        #!/usr/bin/python3
-        import sys
-        for line in sys.stdin:
-            value = float(line.strip())
-            print(value * 2)
-        '''
-        
-        # Create the function
-        fn = ExternalFunction(
-            script=script,
-            script_name='double.py',
-            columns=['close'],
-            output_columns=[('close_doubled', 'Float64')]
-        )
-        
-        # Use it
-        output_table = fn.apply(conn, input_table)
-    
-    Requirements:
-        - The users_scripts directory must be mounted/accessible
-        - In docker: -v /path/to/scripts:/var/lib/clickhouse/user_scripts
-        - Or set CLICKHOUSE_USER_SCRIPTS environment variable
+        price_plus_fee:
+            type:function
+            function:functions.add
+            inputs:[price, fee]
+            left:price
+            right:fee
+        # Or with scalar:
+        price_plus_ten:
+            type:function
+            function:functions.add
+            inputs:[price]
+            left:price
+            right:10
     """
     
-    def __init__(
-        self,
-        script: str | None = None,
-        script_name: str | None = None,
-        script_path: str | None = None,
-        columns: str | list[str] = "close",
-        output_columns: list[tuple[str, str]] | None = None,
-        **kwargs
-    ):
-        super().__init__(columns=columns, **kwargs)
-        
-        if script is not None:
-            self.script_name = script_name or f"tradsl_{uuid.uuid4().hex[:8]}.py"
-        else:
-            self.script_name = script_name
-        
-        self.script = script
-        self.script_path = script_path
-        self._output_columns = output_columns or [("result", "Float64")]
+    def __init__(self, left: str = "col1", right: str = "col2", **kwargs):
+        super().__init__(columns=[left, right], left=left, right=right, **kwargs)
+        self.left = left
+        self.right = right
     
     @property
     def output_columns(self) -> list[tuple[str, str]]:
-        return self._output_columns
+        return [(f"{self.left}_plus_{self.right}", "Float64")]
     
     def apply(self, conn: "ClickHouseConnection", input_table: str) -> str:
-        output_table = self._generate_output_table_name("ext")
+        output_table = self._generate_output_table_name("add")
         
-        script_name = self.script_name
-        if self.script is not None:
-            script_name = script_name or f"tradsl_{uuid.uuid4().hex[:8]}.py"
-            conn.upload_script(script_name, self.script)
-        elif self.script_path is not None:
-            script_name = self.script_path.split('/')[-1]
+        try:
+            scalar = float(self.right)
+            op = f"{self.left} + {scalar}"
+            columns = f"symbol String, timestamp DateTime64, {self.left} Float64, {self.left}_plus_{self.right} Float64"
+            select = f"""
+                SELECT symbol, timestamp, {self.left}, {op}
+                FROM {input_table}
+            """
+        except ValueError:
+            op = f"{self.left} + {self.right}"
+            columns = f"symbol String, timestamp DateTime64, {self.left} Float64, {self.right} Float64, {self.left}_plus_{self.right} Float64"
+            select = f"""
+                SELECT symbol, timestamp, {self.left}, {self.right}, {op}
+                FROM {input_table}
+            """
         
-        if script_name is None:
-            raise ValueError("Either script, script_name, or script_path must be provided")
+        return self._create_and_insert(conn, output_table, columns, select)
+
+
+class Subtract(TimeSeriesFunction):
+    """
+    Subtract two columns or a column and a scalar.
+    
+    Example:
+        price_minus_fee:
+            type:function
+            function:functions.subtract
+            inputs:[price, fee]
+            left:price
+            right:fee
+    """
+    
+    def __init__(self, left: str = "col1", right: str = "col2", **kwargs):
+        super().__init__(columns=[left, right], left=left, right=right, **kwargs)
+        self.left = left
+        self.right = right
+    
+    @property
+    def output_columns(self) -> list[tuple[str, str]]:
+        return [(f"{self.left}_minus_{self.right}", "Float64")]
+    
+    def apply(self, conn: "ClickHouseConnection", input_table: str) -> str:
+        output_table = self._generate_output_table_name("subtract")
         
-        input_cols = ', '.join(self.columns)
-        input_query = f"SELECT {input_cols}, timestamp, symbol FROM {input_table}"
+        try:
+            scalar = float(self.right)
+            op = f"{self.left} - {scalar}"
+            columns = f"symbol String, timestamp DateTime64, {self.left} Float64, {self.left}_minus_{self.right} Float64"
+            select = f"""
+                SELECT symbol, timestamp, {self.left}, {op}
+                FROM {input_table}
+            """
+        except ValueError:
+            op = f"{self.left} - {self.right}"
+            columns = f"symbol String, timestamp DateTime64, {self.left} Float64, {self.right} Float64, {self.left}_minus_{self.right} Float64"
+            select = f"""
+                SELECT symbol, timestamp, {self.left}, {self.right}, {op}
+                FROM {input_table}
+            """
         
-        conn.create_executable_table(
-            table_name=output_table,
-            script_name=script_name,
-            output_columns=self.output_columns,
-            input_query=input_query
-        )
+        return self._create_and_insert(conn, output_table, columns, select)
+
+
+class Multiply(TimeSeriesFunction):
+    """
+    Multiply two columns or a column and a scalar.
+    
+    Example:
+        price_times_quantity:
+            type:function
+            function:functions.multiply
+            inputs:[price, quantity]
+            left:price
+            right:quantity
+    """
+    
+    def __init__(self, left: str = "col1", right: str = "col2", **kwargs):
+        super().__init__(columns=[left, right], left=left, right=right, **kwargs)
+        self.left = left
+        self.right = right
+    
+    @property
+    def output_columns(self) -> list[tuple[str, str]]:
+        return [(f"{self.left}_times_{self.right}", "Float64")]
+    
+    def apply(self, conn: "ClickHouseConnection", input_table: str) -> str:
+        output_table = self._generate_output_table_name("multiply")
         
-        return output_table
+        try:
+            scalar = float(self.right)
+            op = f"{self.left} * {scalar}"
+            columns = f"symbol String, timestamp DateTime64, {self.left} Float64, {self.left}_times_{self.right} Float64"
+            select = f"""
+                SELECT symbol, timestamp, {self.left}, {op}
+                FROM {input_table}
+            """
+        except ValueError:
+            op = f"{self.left} * {self.right}"
+            columns = f"symbol String, timestamp DateTime64, {self.left} Float64, {self.right} Float64, {self.left}_times_{self.right} Float64"
+            select = f"""
+                SELECT symbol, timestamp, {self.left}, {self.right}, {op}
+                FROM {input_table}
+            """
+        
+        return self._create_and_insert(conn, output_table, columns, select)
+
+
+class Divide(TimeSeriesFunction):
+    """
+    Divide two columns or a column by a scalar.
+    
+    Example:
+        price_divided_by_shares:
+            type:function
+            function:functions.divide
+            inputs:[price, shares]
+            left:price
+            right:shares
+    """
+    
+    def __init__(self, left: str = "col1", right: str = "col2", **kwargs):
+        super().__init__(columns=[left, right], left=left, right=right, **kwargs)
+        self.left = left
+        self.right = right
+    
+    @property
+    def output_columns(self) -> list[tuple[str, str]]:
+        return [(f"{self.left}_divided_by_{self.right}", "Nullable(Float64)")]
+    
+    def apply(self, conn: "ClickHouseConnection", input_table: str) -> str:
+        output_table = self._generate_output_table_name("divide")
+        
+        try:
+            scalar = float(self.right)
+            op = f"{self.left} / {scalar}"
+            columns = f"symbol String, timestamp DateTime64, {self.left} Float64, {self.left}_divided_by_{self.right} Nullable(Float64)"
+            select = f"""
+                SELECT symbol, timestamp, {self.left}, {op}
+                FROM {input_table}
+            """
+        except ValueError:
+            op = f"{self.left} / {self.right}"
+            columns = f"symbol String, timestamp DateTime64, {self.left} Float64, {self.right} Float64, {self.left}_divided_by_{self.right} Nullable(Float64)"
+            select = f"""
+                SELECT symbol, timestamp, {self.left}, {self.right}, {op}
+                FROM {input_table}
+            """
+        
+        return self._create_and_insert(conn, output_table, columns, select)

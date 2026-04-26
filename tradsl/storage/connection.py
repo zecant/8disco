@@ -4,8 +4,20 @@ ClickHouse connection wrapper for TradSL.
 Provides a simple interface for executing queries and loading data.
 """
 import io
-import pandas as pd
+import os
+from io import BytesIO
 from typing import Optional, Any
+
+import pandas as pd
+
+try:
+    import pyarrow as pa
+    import polars as pl
+    HAS_ARROW = True
+except ImportError:
+    HAS_ARROW = False
+    pa = None
+    pl = None
 
 
 class ClickHouseConnection:
@@ -140,81 +152,110 @@ class ClickHouseConnection:
         """
         self.execute(f"DROP TABLE IF EXISTS {table_name}")
     
-    def get_users_scripts_path(self) -> str:
+    def query_arrow(self, query: str) -> "pa.Table":
         """
-        Get the users_scripts path from ClickHouse config.
-        
-        Returns:
-            Path to users_scripts directory
-        """
-        result = self.query("SELECT * FROM system.errors WHERE name = ''")
-        try:
-            result = self.query("SELECT * FROM system.build_options")
-            for _, row in result.iterrows():
-                if row['name'] == 'CLICKHOUSE_BUILD_GCC_SUFFIX':
-                    break
-        except:
-            pass
-        return '/var/lib/clickhouse/user_scripts'
-    
-    def upload_script(self, script_name: str, script_content: str) -> str:
-        """
-        Upload a Python script to ClickHouse's users_scripts directory.
-        
-        Note: This requires the users_scripts directory to be mounted/accessible.
-        In docker, mount: -v /path/to/scripts:/var/lib/clickhouse/user_scripts
+        Execute a SQL query and return results as PyArrow Table.
         
         Args:
-            script_name: Name of the script file (e.g., 'my_func.py')
-            script_content: Python script content
+            query: SQL query to execute
             
         Returns:
-            Path where script was uploaded
+            PyArrow Table with query results
         """
-        import os
+        import requests
         
-        scripts_path = os.environ.get('CLICKHOUSE_USER_SCRIPTS', '/var/lib/clickhouse/user_scripts')
-        script_path = os.path.join(scripts_path, script_name)
+        query_with_format = query + " FORMAT ArrowStream"
         
-        with open(script_path, 'w') as f:
-            f.write(script_content)
+        response = requests.post(
+            self._url,
+            params=self._params(),
+            data=query_with_format,
+            timeout=self.timeout,
+        )
+        response.raise_for_status()
         
-        os.chmod(script_path, 0o755)
+        if not response.content:
+            raise ValueError("Empty response from ClickHouse")
         
-        return script_path
+        return pa.ipc.open_stream(BytesIO(response.content)).read_all()
     
-    def create_executable_table(
-        self,
-        table_name: str,
-        script_name: str,
-        output_columns: list[tuple[str, str]],
-        input_query: str,
-    ) -> str:
+    def query_polars(self, query: str) -> "pl.DataFrame":
         """
-        Create an Executable table that runs a Python script.
+        Execute a SQL query and return results as Polars DataFrame.
         
         Args:
-            table_name: Name for the output table
-            script_name: Name of script in users_scripts folder
-            output_columns: List of (name, type) tuples for output
-            input_query: SQL query whose results are passed to the script
+            query: SQL query to execute
             
         Returns:
-            Table name
+            Polars DataFrame with query results
         """
-        columns_sql = ', '.join(f"{name} {dtype}" for name, dtype in output_columns)
+        arrow_table = self.query_arrow(query)
+        return pl.from_arrow(arrow_table)
+    
+    def insert_arrow(self, table_name: str, table: "pa.Table", create: bool = True) -> None:
+        """
+        Insert a PyArrow Table into ClickHouse.
         
-        sql = f"""
-            CREATE TABLE {table_name} (
-                {columns_sql}
-            ) ENGINE = Executable(
-                '{script_name}',
-                'TabSeparated',
-                ({input_query})
-            )
+        Args:
+            table_name: Target table name
+            table: PyArrow Table to insert
+            create: If True, CREATE TABLE first; if False, INSERT only
         """
-        self.execute(sql)
-        return table_name
+        import requests
+        import polars as pl
+        
+        if create:
+            # Map pyarrow types to ClickHouse types
+            type_mapping = {
+                'string': 'String',
+                'int64': 'Int64',
+                'int32': 'Int32',
+                'float64': 'Float64',
+                'float32': 'Float32',
+                'timestamp[ms]': 'DateTime64',
+                'timestamp[us]': 'DateTime64',
+                'bool': 'UInt8',
+            }
+            columns = []
+            for field in table.schema:
+                ch_type = type_mapping.get(str(field.type), 'String')
+                columns.append(f"{field.name} {ch_type}")
+            
+            columns_sql = ', '.join(columns)
+            self.execute(f"""
+                CREATE TABLE IF NOT EXISTS {table_name} (
+                    {columns_sql}
+                ) ENGINE = MergeTree()
+                ORDER BY tuple()
+            """)
+        
+        df = pl.from_arrow(table)
+        
+        buf = BytesIO()
+        df.write_csv(buf, separator='\t', include_header=False)
+        buf.seek(0)
+        
+        # Use INSERT with FORMAT
+        insert_sql = f"INSERT INTO {table_name} FORMAT TabSeparated"
+        response = requests.post(
+            self._url,
+            params=self._params(),
+            data=insert_sql + "\n" + buf.read().decode('utf-8'),
+            timeout=self.timeout,
+        )
+        response.raise_for_status()
+    
+    def insert_polars(self, table_name: str, df: "pl.DataFrame", create: bool = True) -> None:
+        """
+        Insert a Polars DataFrame into ClickHouse.
+        
+        Args:
+            table_name: Target table name
+            df: Polars DataFrame to insert
+            create: If True, CREATE TABLE first; if False, INSERT only
+        """
+        arrow_table = df.to_arrow()
+        self.insert_arrow(table_name, arrow_table, create=create)
     
     def __enter__(self):
         return self

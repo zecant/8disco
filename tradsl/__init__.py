@@ -33,8 +33,13 @@ from tradsl.functions import (
     SMA,
     Returns,
     LogReturn,
-    ExternalFunction,
+    Mean,
+    Add,
+    Subtract,
+    Multiply,
+    Divide,
 )
+from tradsl.python import ArrowFunction, SMA as PythonSMA, EMA as PythonEMA, Returns as PythonReturns
 from tradsl.adapters import Adapter, ParquetAdapter, CSVAdapter
 from tradsl.storage import ClickHouseConnection
 
@@ -44,13 +49,21 @@ __all__ = [
     "DAG",
     "Node",
     "TimeSeriesFunction",
+    "ArrowFunction",
     "SignalType",
     "Lag",
     "EMA",
     "SMA",
     "Returns",
     "LogReturn",
-    "ExternalFunction",
+    "Mean",
+    "Add",
+    "Subtract",
+    "Multiply",
+    "Divide",
+    "PythonSMA",
+    "PythonEMA",
+    "PythonReturns",
     "Adapter",
     "ParquetAdapter",
     "CSVAdapter",
@@ -65,10 +78,19 @@ __all__ = [
 default_registry: dict[str, object] = {
     "parquet": ParquetAdapter,
     "csv": CSVAdapter,
+    # SQL functions
     "functions.lag": Lag,
     "functions.ema": EMA,
     "functions.sma": SMA,
     "functions.returns": Returns,
     "functions.logreturn": LogReturn,
-    "external.double": ExternalFunction,
+    "functions.mean": Mean,
+    "functions.add": Add,
+    "functions.subtract": Subtract,
+    "functions.multiply": Multiply,
+    "functions.divide": Divide,
+    # Python/Arrow functions
+    "functions.python.sma": PythonSMA,
+    "functions.python.ema": PythonEMA,
+    "functions.python.returns": PythonReturns,
 }
